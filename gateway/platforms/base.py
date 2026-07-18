@@ -2093,6 +2093,27 @@ class EphemeralReply(str):
         instance.ttl_seconds = ttl_seconds
         return instance
 
+
+class ExactDeliveryReply(str):
+    """S7S typed transport bridge for verbatim byte-exact delivery.
+
+    When the GatewayRunner returns this instead of a plain string, the
+    base adapter skips all text extraction/transforms (media, images,
+    local paths, strip) and passes the raw text to the platform adapter
+    with exact_delivery metadata. The platform adapter then uses
+    split-only chunking without indicators or formatting.
+
+    Subclasses str for backward-compatibility with any code that treats
+    the response as a string.
+    """
+
+    declared_sha256: str
+
+    def __new__(cls, text: str, declared_sha256: str):
+        instance = super().__new__(cls, text)
+        instance.declared_sha256 = declared_sha256
+        return instance
+
     @property
     def text(self) -> str:
         """Return the underlying text.
@@ -4937,6 +4958,8 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+            _is_exact_delivery = isinstance(response, ExactDeliveryReply)
+            _exact_delivery_sha = getattr(response, "declared_sha256", None) if _is_exact_delivery else None
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -4979,30 +5002,38 @@ class BasePlatformAdapter(ABC):
                 # Pre-extract snapshot for the #29346 recovery/invariant below.
                 _response_pre_extract = response
 
-                # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                # S7S: ExactDeliveryReply — skip ALL extraction/transforms.
+                # Raw text flows directly to the send path with exact metadata.
+                if _is_exact_delivery:
+                    media_files = []
+                    images = []
+                    local_files = []
+                    text_content = str(response)
+                else:
+                    # Extract MEDIA:<path> tags (from TTS tool) before other processing
+                    media_files, response = self.extract_media(response)
+                    media_files = self.filter_media_delivery_paths(media_files)
 
-                # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
-                # Strip any remaining internal directives from message body (fixes #1561).
-                # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
-                # with an unknown extension is intentionally left in the body for
-                # extract_local_files below to pick up rather than silently dropped (#34517).
-                text_content = _strip_media_directives(text_content).strip()
-                if images:
-                    logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
+                    # Extract image URLs and send them as native platform attachments
+                    images, text_content = self.extract_images(response)
+                    # Strip any remaining internal directives from message body (fixes #1561).
+                    # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
+                    # with an unknown extension is intentionally left in the body for
+                    # extract_local_files below to pick up rather than silently dropped (#34517).
+                    text_content = _strip_media_directives(text_content).strip()
+                    if images:
+                        logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
-                local_files = []
-                if not is_ephemeral_response:
-                    # Auto-detect bare local file paths for native media delivery
-                    # (helps small models that don't use MEDIA: syntax). Skip
-                    # system/command notices so config paths stay visible text
-                    # instead of becoming native uploads.
-                    local_files, text_content = self.extract_local_files(text_content)
-                    local_files = self.filter_local_delivery_paths(local_files)
-                    if local_files:
-                        logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                    local_files = []
+                    if not is_ephemeral_response:
+                        # Auto-detect bare local file paths for native media delivery
+                        # (helps small models that don't use MEDIA: syntax). Skip
+                        # system/command notices so config paths stay visible text
+                        # instead of becoming native uploads.
+                        local_files, text_content = self.extract_local_files(text_content)
+                        local_files = self.filter_local_delivery_paths(local_files)
+                        if local_files:
+                            logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
                 # A2 (#29346): extraction can reduce a non-empty response to
                 # empty text with no attachment, and the `if text_content` guard
@@ -5027,6 +5058,13 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+
+                # S7S: inject exact_delivery flag into metadata for adapter
+                if _is_exact_delivery and _exact_delivery_sha:
+                    if _final_thread_metadata is None:
+                        _final_thread_metadata = {}
+                    _final_thread_metadata["exact_delivery"] = True
+                    _final_thread_metadata["exact_delivery_sha256"] = _exact_delivery_sha
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

@@ -2029,9 +2029,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._is_forum_parent(channel):
                 return await self._send_to_forum(channel, content)
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            # S7S: exact_delivery mode — raw split-only chunks, no format/indicators
+            _exact_mode = metadata.get("exact_delivery") if metadata else False
+            if _exact_mode:
+                chunks = self._split_only_raw(content, self.MAX_MESSAGE_LENGTH)
+            else:
+                # Format and split message if needed
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
             reference = None
@@ -3993,6 +3998,31 @@ class DiscordAdapter(BasePlatformAdapter):
         os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
         if resolved_count:
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
+
+    @staticmethod
+    def _split_only_raw(content: str, max_length: int) -> list:
+        """S7S: split content into chunks at safe boundaries without any transformation.
+
+        No indicators, no format_message, no lstrip, no table conversion.
+        Ordered concatenation of returned chunks == original content exactly.
+        """
+        if len(content) <= max_length:
+            return [content]
+        chunks = []
+        remaining = content
+        while remaining:
+            if len(remaining) <= max_length:
+                chunks.append(remaining)
+                break
+            # Find a natural split point (newline preferred, then space)
+            split_at = remaining.rfind("\n", 0, max_length)
+            if split_at < max_length // 2:
+                split_at = remaining.rfind(" ", 0, max_length)
+            if split_at < max_length // 4:
+                split_at = max_length  # hard split
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+        return chunks
 
     def format_message(self, content: str) -> str:
         """Format message for Discord.

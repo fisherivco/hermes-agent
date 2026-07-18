@@ -449,14 +449,19 @@ def _s7s_verbatim_delivery_or_fallback(
 ) -> str:
     """Return the tool-declared verbatim message if all gates pass.
 
-    Gates (ALL must pass or we fall through to current_response unchanged):
-    1. Config gate: gateway.verbatim_delivery_enabled must be boolean True.
-    2. Freshness: only the LAST tool-result message qualifies (current turn).
-    3. Envelope: declares final_report_delivery_contract.mode == "exact_verbatim".
-    4. Field non-empty: final_report_message is a non-empty, non-whitespace string.
-    5. SHA: declared sha256 is valid hex64 and matches recomputed sha256(field).
+    Architecture (Option C — exact-modulo-declared-platform-pagination):
+    The GatewayRunner override delivers verbatim bytes that the platform
+    adapter may chunk with indicators. The 4-stream gate compares
+    reassembled chunks with indicators stripped (pinned pattern).
 
-    Any failure -> log + return current_response (fail-closed to current behavior).
+    Gates (ALL must pass or fall through unchanged):
+    1. Config gate: gateway.verbatim_delivery_enabled must be boolean True.
+    2. NOT already_sent (F7): streaming path must not have already delivered.
+    3. Freshness: only current-turn tool-result qualifies.
+    4. Envelope: declares final_report_delivery_contract.mode == "exact_verbatim".
+    5. Field non-empty, non-whitespace.
+    6. SHA: valid hex64, matches recomputed sha256(field).
+    7. SAFETY-BEFORE-EXACT (F6): mandatory redaction must NOT alter the bytes.
     """
     try:
         cfg = _load_gateway_config()
@@ -464,7 +469,12 @@ def _s7s_verbatim_delivery_or_fallback(
         if not isinstance(gw, dict):
             return current_response
         gate = gw.get("verbatim_delivery_enabled")
-        if gate is not True:  # F3: strict boolean, not truthy
+        if gate is not True:
+            return current_response
+
+        # F7: if streaming already sent, we cannot override
+        if agent_result.get("already_sent"):
+            logger.debug("s7s verbatim: already_sent=True — fallback (streaming delivered)")
             return current_response
 
         delivery = _extract_verbatim_delivery_envelope(agent_result.get("messages"))
@@ -474,22 +484,16 @@ def _s7s_verbatim_delivery_or_fallback(
         message = delivery.get("final_report_message")
         declared_sha = delivery.get("final_report_message_sha256")
 
-        # F3: non-empty, non-whitespace message
         if not message or not isinstance(message, str) or not message.strip():
-            logger.warning(
-                "s7s verbatim: envelope present but field empty/whitespace — fallback"
-            )
+            logger.warning("s7s verbatim: field empty/whitespace — fallback")
             return current_response
 
-        # F3: validate SHA format (lowercase hex, exactly 64 chars)
         if (
             not isinstance(declared_sha, str)
             or len(declared_sha) != 64
             or not all(c in "0123456789abcdef" for c in declared_sha)
         ):
-            logger.warning(
-                "s7s verbatim: declared SHA is not valid hex64 — fallback"
-            )
+            logger.warning("s7s verbatim: declared SHA not valid hex64 — fallback")
             return current_response
 
         import hashlib as _hashlib
@@ -501,11 +505,29 @@ def _s7s_verbatim_delivery_or_fallback(
             )
             return current_response
 
+        # F6 SAFETY-BEFORE-EXACT: run mandatory redaction on the candidate.
+        # If redaction alters bytes, fail closed — never deliver unredacted.
+        try:
+            from gateway.run import _sanitize_gateway_final_response
+            # Use a neutral platform (None) for the redaction check — we only
+            # care about secret/credential stripping, not platform-specific formatting.
+            redacted = _redact_gateway_user_facing_secrets(str(message))
+            if redacted != message:
+                logger.warning(
+                    "s7s verbatim: SAFETY — redaction altered bytes (credential-shaped content detected); "
+                    "failing closed to redacted normal path. sha_mismatch_due_to_redaction=True"
+                )
+                return current_response
+        except Exception as _safety_err:
+            logger.warning("s7s verbatim: safety check failed (%s) — fallback", _safety_err)
+            return current_response
+
         logger.info(
-            "s7s verbatim delivery: sha=%s chars=%d (bypassing all downstream mutations)",
+            "s7s verbatim delivery: sha=%s chars=%d (typed ExactDeliveryReply bridge)",
             declared_sha[:12], len(message),
         )
-        return message
+        from gateway.platforms.base import ExactDeliveryReply
+        return ExactDeliveryReply(message, declared_sha256=declared_sha)
     except Exception as exc:
         logger.debug("s7s verbatim: unexpected error %s — fallback", exc)
         return current_response
