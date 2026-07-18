@@ -2041,9 +2041,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 # R3: last-hop SHA verification — confirm bytes are still exact
                 import hashlib as _hl
                 _exact_sha = metadata.get("exact_delivery_sha256", "") if metadata else ""
+                # H1: SHA is REQUIRED for exact delivery — missing/empty/malformed = refuse
+                if not _exact_sha or not isinstance(_exact_sha, str) or len(_exact_sha) != 64 or not all(c in "0123456789abcdef" for c in _exact_sha):
+                    logger.error("s7s exact delivery: declared SHA missing/malformed — fail-closed (no send)")
+                    return SendResult(success=False, error="exact_delivery requires valid hex64 SHA")
                 _joined = "".join(chunks)
                 _computed = _hl.sha256(_joined.encode("utf-8")).hexdigest()
-                if _exact_sha and _computed != _exact_sha:
+                if _computed != _exact_sha:
                     logger.error(
                         "s7s exact delivery: LAST-HOP SHA MISMATCH joined=%s declared=%s — fail-closed (no send)",
                         _computed[:12], _exact_sha[:12],

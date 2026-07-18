@@ -449,10 +449,12 @@ def _s7s_verbatim_delivery_or_fallback(
 ) -> str:
     """Return the tool-declared verbatim message if all gates pass.
 
-    Architecture (Option C — exact-modulo-declared-platform-pagination):
-    The GatewayRunner override delivers verbatim bytes that the platform
-    adapter may chunk with indicators. The 4-stream gate compares
-    reassembled chunks with indicators stripped (pinned pattern).
+    Architecture (typed ExactDeliveryReply bridge):
+    GatewayRunner constructs ExactDeliveryReply after safety-before-exact.
+    BasePlatformAdapter recognizes it before extraction, skips all transforms,
+    injects exact_delivery metadata. DiscordAdapter uses raw split-only chunks
+    with last-hop SHA verification. TRUE byte-exact (no indicators, no lstrip,
+    no table conversion). Ordered join of chunks == original bytes exactly.
 
     Gates (ALL must pass or fall through unchanged):
     1. Config gate: gateway.verbatim_delivery_enabled must be boolean True.
