@@ -2093,6 +2093,16 @@ class EphemeralReply(str):
         instance.ttl_seconds = ttl_seconds
         return instance
 
+    @property
+    def text(self) -> str:
+        """Return the underlying text.
+
+        Provided for call sites that want an explicit string conversion,
+        though ``str(reply)`` and using ``reply`` directly where a string
+        is expected both work identically.
+        """
+        return str.__str__(self)
+
 
 class ExactDeliveryReply(str):
     """S7S typed transport bridge for verbatim byte-exact delivery.
@@ -2113,16 +2123,6 @@ class ExactDeliveryReply(str):
         instance = super().__new__(cls, text)
         instance.declared_sha256 = declared_sha256
         return instance
-
-    @property
-    def text(self) -> str:
-        """Return the underlying text.
-
-        Provided for call sites that want an explicit string conversion,
-        though ``str(reply)`` and using ``reply`` directly where a string
-        is expected both work identically.
-        """
-        return str.__str__(self)
 
 
 def merge_pending_message_event(

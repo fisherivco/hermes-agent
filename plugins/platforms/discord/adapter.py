@@ -2026,13 +2026,29 @@ class DiscordAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
             # Forum channels reject channel.send() — create a thread post instead.
+            # S7S: exact_delivery mode check FIRST — forum posts under exact mode
+            # fail-closed (forum formatting mutates bytes).
+            _exact_mode = metadata.get("exact_delivery") if metadata else False
             if self._is_forum_parent(channel):
+                if _exact_mode:
+                    logger.warning("s7s exact delivery: forum-parent channel — fail-closed (format mutation)")
+                    return SendResult(success=False, error="exact_delivery incompatible with forum channels")
                 return await self._send_to_forum(channel, content)
 
             # S7S: exact_delivery mode — raw split-only chunks, no format/indicators
-            _exact_mode = metadata.get("exact_delivery") if metadata else False
             if _exact_mode:
                 chunks = self._split_only_raw(content, self.MAX_MESSAGE_LENGTH)
+                # R3: last-hop SHA verification — confirm bytes are still exact
+                import hashlib as _hl
+                _exact_sha = metadata.get("exact_delivery_sha256", "") if metadata else ""
+                _joined = "".join(chunks)
+                _computed = _hl.sha256(_joined.encode("utf-8")).hexdigest()
+                if _exact_sha and _computed != _exact_sha:
+                    logger.error(
+                        "s7s exact delivery: LAST-HOP SHA MISMATCH joined=%s declared=%s — fail-closed (no send)",
+                        _computed[:12], _exact_sha[:12],
+                    )
+                    return SendResult(success=False, error="exact_delivery last-hop SHA mismatch")
             else:
                 # Format and split message if needed
                 formatted = self.format_message(content)
