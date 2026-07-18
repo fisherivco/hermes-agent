@@ -439,6 +439,101 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+# ---------------------------------------------------------------------------
+# S7S: verbatim delivery projection (A054 — gateway last-hop seam)
+# ---------------------------------------------------------------------------
+
+def _s7s_verbatim_delivery_or_fallback(
+    agent_result: dict,
+    current_response: str,
+) -> str:
+    """Return the tool-declared verbatim message if all gates pass.
+
+    Gates (ALL must pass or we fall through to current_response unchanged):
+    1. Config gate: gateway.verbatim_delivery_enabled must be true.
+    2. Envelope present: last tool-result in messages declares
+       final_report_delivery_contract.mode == "exact_verbatim".
+    3. Field non-empty: final_report_message is a non-empty string.
+    4. SHA verification: recomputed sha256(field) == declared sha256.
+
+    Any failure -> log + return current_response (fail-closed to current behavior).
+    """
+    try:
+        cfg = _load_gateway_config()
+        gw = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+        if not (isinstance(gw, dict) and gw.get("verbatim_delivery_enabled")):
+            return current_response
+
+        delivery = _extract_verbatim_delivery_envelope(agent_result.get("messages"))
+        if delivery is None:
+            return current_response
+
+        message = delivery.get("final_report_message")
+        declared_sha = delivery.get("final_report_message_sha256")
+        if not message or not isinstance(message, str) or not declared_sha:
+            logger.warning(
+                "s7s verbatim: envelope present but field empty/missing — fallback"
+            )
+            return current_response
+
+        import hashlib as _hashlib
+        computed_sha = _hashlib.sha256(message.encode("utf-8")).hexdigest()
+        if computed_sha != declared_sha:
+            logger.warning(
+                "s7s verbatim: SHA mismatch declared=%s computed=%s — fallback",
+                declared_sha[:12], computed_sha[:12],
+            )
+            return current_response
+
+        logger.info(
+            "s7s verbatim delivery: sha=%s chars=%d (bypassing model final_response)",
+            declared_sha[:12], len(message),
+        )
+        return message
+    except Exception as exc:
+        logger.debug("s7s verbatim: unexpected error %s — fallback", exc)
+        return current_response
+
+
+def _extract_verbatim_delivery_envelope(
+    messages: list | None,
+) -> dict | None:
+    """Scan the last few messages for a tool-result declaring exact_verbatim.
+
+    Returns the parsed tool-output dict if found, else None.
+    """
+    if not messages or not isinstance(messages, list):
+        return None
+    import json as _json
+    # Scan from the end (the delivery envelope is in the last tool-result)
+    for msg in reversed(messages[-10:]):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "")
+        if role != "tool":
+            # Also check for assistant messages with tool_calls content
+            if role == "assistant":
+                continue
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            parsed = _json.loads(content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        contract = parsed.get("final_report_delivery_contract")
+        if isinstance(contract, dict) and contract.get("mode") == "exact_verbatim":
+            return parsed
+    return None
+
+
+# S7S_PATCH_MARKER: a054-gateway-verbatim-delivery-v1
+# ---------------------------------------------------------------------------
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -12068,6 +12163,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+
+            # --- S7S verbatim delivery projection (A054) ---
+            # When the ingest tool envelope declares exact_verbatim delivery
+            # and the gateway config gate is enabled, deliver the tool-declared
+            # message directly instead of the model's final_response.
+            response = _s7s_verbatim_delivery_or_fallback(
+                agent_result, response,
+            )
+
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
