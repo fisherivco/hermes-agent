@@ -535,6 +535,67 @@ def _s7s_verbatim_delivery_or_fallback(
         return current_response
 
 
+_TYPED_FINAL_DELIVERY_REFUSAL = (
+    "Exact delivery refused: the typed payload failed validation."
+)
+
+
+async def _send_auto_voice_unless_typed(
+    runner,
+    event,
+    response,
+    agent_messages,
+    agent_result,
+    *,
+    already_sent,
+) -> None:
+    """Keep typed exact delivery free of pre-bridge outbound side effects."""
+    if isinstance(agent_result, dict) and "final_delivery" in agent_result:
+        return
+    if runner._should_send_voice_reply(
+        event, response, agent_messages, already_sent=already_sent
+    ):
+        await runner._send_voice_reply(event, response)
+
+
+def _typed_final_delivery_or_fallback(
+    agent_result: dict,
+    current_response: str,
+) -> str:
+    """Project only the agent loop's typed top-level final_delivery."""
+    try:
+        cfg = _load_gateway_config()
+        gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(gateway_cfg, dict) or gateway_cfg.get("verbatim_delivery_enabled") is not True:
+            return current_response
+        if agent_result.get("already_sent"):
+            return current_response
+        if "final_delivery" not in agent_result:
+            return current_response
+        delivery = agent_result.get("final_delivery")
+        if not isinstance(delivery, dict):
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        message = delivery.get("message")
+        digest = delivery.get("sha256")
+        if not isinstance(message, str) or not message.strip() or message.endswith(("\n", "\r")):
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        import hashlib as _hashlib
+        if _hashlib.sha256(message.encode("utf-8")).hexdigest() != digest:
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        if _redact_gateway_user_facing_secrets(message) != message:
+            logger.error("typed exact delivery refused: mandatory redaction changed bytes")
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        from gateway.platforms.base import ExactDeliveryReply
+        return ExactDeliveryReply(message, declared_sha256=digest)
+    except Exception as exc:
+        logger.error("typed exact delivery refused: %s", exc)
+        if "final_delivery" in agent_result:
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        return current_response
+
+
 def _extract_verbatim_delivery_envelope(
     messages: list | None,
 ) -> dict | None:
@@ -12719,8 +12780,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
-                await self._send_voice_reply(event, response)
+            await _send_auto_voice_unless_typed(
+                self,
+                event,
+                response,
+                agent_messages,
+                agent_result,
+                already_sent=_already_sent,
+            )
+
+            # A typed exact result is mutually exclusive with streaming.  If
+            # an inconsistent caller marks it already_sent, do not emit media
+            # or footer side effects before the typed bridge can refuse it.
+            if "final_delivery" in agent_result and _already_sent:
+                logger.error(
+                    "typed exact delivery refused: already_sent is incompatible"
+                )
+                return None
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -12764,7 +12840,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # response with the SHA-verified tool-declared bytes. This is the
             # LAST possible override before platform send — nothing downstream
             # can mutate it.
-            response = _s7s_verbatim_delivery_or_fallback(
+            response = _typed_final_delivery_or_fallback(
                 agent_result, response,
             )
 

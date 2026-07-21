@@ -632,6 +632,8 @@ def run_conversation(
     # user-facing result available; it must not be confused with error or
     # recovery text produced by unrelated exit paths.
     _pending_verification_response = None
+    _typed_final_delivery = None
+    _exact_delivery_refusal = None
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -4874,6 +4876,46 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                # RC-A054-4: a single successful current-turn invocation of the
+                # public ingest launcher owns its final bytes.  Qualify only
+                # that narrow lane and return before another provider request.
+                from agent.final_delivery import (
+                    FinalDeliveryError,
+                    is_terminal_final_delivery_candidate,
+                    parse_terminal_final_delivery,
+                )
+                if is_terminal_final_delivery_candidate(assistant_message.tool_calls):
+                    _current_call_ids = {
+                        getattr(tc, "id", None) for tc in assistant_message.tool_calls
+                    }
+                    _current_results = [
+                        msg for msg in messages
+                        if isinstance(msg, dict)
+                        and msg.get("role") == "tool"
+                        and msg.get("tool_call_id") in _current_call_ids
+                    ]
+                    try:
+                        _final_delivery = parse_terminal_final_delivery(
+                            assistant_message.tool_calls,
+                            _current_results,
+                        )
+                    except FinalDeliveryError as exc:
+                        _refusal = f"Exact delivery refused: {exc}"
+                        messages.append({"role": "assistant", "content": _refusal})
+                        final_response = _refusal
+                        _exact_delivery_refusal = _refusal
+                        failed = True
+                        _turn_exit_reason = "exact_delivery_refused"
+                        break
+                    messages.append({
+                        "role": "assistant",
+                        "content": _final_delivery.message,
+                    })
+                    final_response = _final_delivery.message
+                    _typed_final_delivery = _final_delivery
+                    _turn_exit_reason = "exact_delivery_success"
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
@@ -5540,7 +5582,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    _result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -5556,6 +5598,29 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
     )
+    if _typed_final_delivery is not None:
+        _persist_failed = any(
+            isinstance(error, str) and error.startswith("persist_session:")
+            for error in _result.get("cleanup_errors", ())
+        )
+        if _persist_failed:
+            # Exact delivery is durability-gated: the gateway must never emit
+            # bytes whose synthetic assistant row failed canonical persistence.
+            _durability_refusal = (
+                "Exact delivery refused: the exact response could not be durably persisted."
+            )
+            _result["final_response"] = _durability_refusal
+            _result["completed"] = False
+            _result["failed"] = True
+            _result["turn_exit_reason"] = "exact_delivery_refused"
+            return _result
+        # The canonical finalizer owns lifecycle cleanup and result metadata,
+        # but no post-loop response transform may mutate exact delivery bytes.
+        _result["final_response"] = _typed_final_delivery.message
+        _result["final_delivery"] = _typed_final_delivery.as_dict()
+    elif _exact_delivery_refusal is not None:
+        _result["final_response"] = _exact_delivery_refusal
+    return _result
 
 
 

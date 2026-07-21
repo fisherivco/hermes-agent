@@ -2059,6 +2059,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
+            returned_chunks = []
             reference = None
 
             if reply_to and self._reply_to_mode != "off":
@@ -2077,9 +2078,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
+                    _send_kwargs = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if _exact_mode:
+                        _send_kwargs["allowed_mentions"] = discord.AllowedMentions(
+                            everyone=False,
+                            users=False,
+                            roles=False,
+                            replied_user=False,
+                        )
                     msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
+                        **_send_kwargs,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -2099,13 +2110,35 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        _send_kwargs["reference"] = None
+                        msg = await channel.send(**_send_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                if _exact_mode:
+                    _returned = getattr(msg, "content", None)
+                    if not isinstance(_returned, str) or _returned != chunk:
+                        logger.error(
+                            "s7s exact delivery: returned content mismatch at chunk %d — fail-closed",
+                            i,
+                        )
+                        return SendResult(
+                            success=False,
+                            error=f"exact_delivery returned content mismatch at chunk {i}",
+                            raw_response={"message_ids": message_ids},
+                        )
+                    returned_chunks.append(_returned)
+
+            if _exact_mode:
+                _returned_content = "".join(returned_chunks)
+                _returned_sha = _hl.sha256(_returned_content.encode("utf-8")).hexdigest()
+                if _returned_content != content or _returned_sha != _exact_sha:
+                    logger.error("s7s exact delivery: ordered returned ACK mismatch — fail-closed")
+                    return SendResult(
+                        success=False,
+                        error="exact_delivery ordered returned content mismatch",
+                        raw_response={"message_ids": message_ids},
+                    )
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -2119,7 +2152,13 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response={
+                    "message_ids": message_ids,
+                    **({
+                        "returned_content": _returned_content,
+                        "returned_content_sha256": _returned_sha,
+                    } if _exact_mode else {}),
+                }
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
