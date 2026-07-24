@@ -4876,12 +4876,13 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
-                # RC-A054-4: a single successful current-turn invocation of the
-                # public ingest launcher owns its final bytes.  Qualify only
-                # that narrow lane and return before another provider request.
+                # RC-A054-4/#261: the public ingest launcher owns terminal
+                # report bytes, while declared semantic-exchange midstates
+                # stay in the normal provider loop.
                 from agent.final_delivery import (
                     FinalDeliveryError,
                     is_terminal_final_delivery_candidate,
+                    parse_declared_intermediate_state,
                     parse_terminal_final_delivery,
                 )
                 if is_terminal_final_delivery_candidate(assistant_message.tool_calls):
@@ -4895,26 +4896,34 @@ def run_conversation(
                         and msg.get("tool_call_id") in _current_call_ids
                     ]
                     try:
-                        _final_delivery = parse_terminal_final_delivery(
+                        _intermediate_state = parse_declared_intermediate_state(
                             assistant_message.tool_calls,
                             _current_results,
                         )
-                    except FinalDeliveryError as exc:
-                        _refusal = f"Exact delivery refused: {exc}"
-                        messages.append({"role": "assistant", "content": _refusal})
-                        final_response = _refusal
-                        _exact_delivery_refusal = _refusal
-                        failed = True
-                        _turn_exit_reason = "exact_delivery_refused"
+                    except FinalDeliveryError:
+                        _intermediate_state = None
+                    if _intermediate_state is None:
+                        try:
+                            _final_delivery = parse_terminal_final_delivery(
+                                assistant_message.tool_calls,
+                                _current_results,
+                            )
+                        except FinalDeliveryError as exc:
+                            _refusal = f"Exact delivery refused: {exc}"
+                            messages.append({"role": "assistant", "content": _refusal})
+                            final_response = _refusal
+                            _exact_delivery_refusal = _refusal
+                            failed = True
+                            _turn_exit_reason = "exact_delivery_refused"
+                            break
+                        messages.append({
+                            "role": "assistant",
+                            "content": _final_delivery.message,
+                        })
+                        final_response = _final_delivery.message
+                        _typed_final_delivery = _final_delivery
+                        _turn_exit_reason = "exact_delivery_success"
                         break
-                    messages.append({
-                        "role": "assistant",
-                        "content": _final_delivery.message,
-                    })
-                    final_response = _final_delivery.message
-                    _typed_final_delivery = _final_delivery
-                    _turn_exit_reason = "exact_delivery_success"
-                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

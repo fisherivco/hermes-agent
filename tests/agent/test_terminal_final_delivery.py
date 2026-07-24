@@ -62,7 +62,79 @@ def _envelope(message: str = "## Exact report") -> dict:
     }
 
 
-def _pair(*, envelope=None, command=None, outer=None, background=False):
+def _material_blocked_envelope(
+    message: str = "Material settlement retained",
+) -> dict:
+    material_report = {
+        "state": "MATERIAL_BLOCKED_RETAINED",
+        "source_key": "src_test",
+        "draft_path": "memory/inbox/test.md",
+        "counts": {
+            "required": 1,
+            "complete": 0,
+            "pending_retryable": 0,
+            "terminal": 1,
+        },
+        "blocked_components": ["image-1"],
+        "reason": "required_material_is_terminal",
+        "semantic_authoring_allowed": False,
+        "next_action": "retain_material_state_and_stop",
+    }
+    return {
+        "state": "MATERIAL_BLOCKED_RETAINED",
+        "material_report": material_report,
+        "final_report_contract": {
+            "version": "a054.material-blocked-report.v1.verbatim",
+            "authoritative_field": "final_report_message",
+            "sha256_field": "final_report_message_sha256",
+            "encoding": "utf-8",
+            "normalization": "none",
+            "delivery": "exact_verbatim",
+            "terminal_newline": "forbidden",
+            "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+            "model_reauthoring_allowed": False,
+            "required_fields": [
+                "state",
+                "source_key",
+                "draft_path",
+                "counts",
+                "blocked_components",
+                "reason",
+                "semantic_authoring_allowed",
+                "next_action",
+            ],
+            "counts_source": "durable_material_state",
+            "success": False,
+        },
+        "final_report_message": message,
+        "final_report_message_sha256": hashlib.sha256(
+            message.encode()
+        ).hexdigest(),
+        "final_report_delivery_contract": {
+            "version": "a054.material-blocked-report-delivery.v1",
+            "authoritative_field": "final_report_message",
+            "sha256_field": "final_report_message_sha256",
+            "encoding": "utf-8",
+            "normalization": "none",
+            "mode": "exact_verbatim",
+            "preamble_allowed": False,
+            "suffix_allowed": False,
+            "translation_allowed": False,
+            "reconstruction_allowed": False,
+            "terminal_newline": "forbidden",
+            "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+        },
+    }
+
+
+def _pair(
+    *,
+    envelope=None,
+    command=None,
+    outer=None,
+    background=False,
+    exit_code=0,
+):
     call = SimpleNamespace(
         id="call-1",
         function=SimpleNamespace(
@@ -75,7 +147,7 @@ def _pair(*, envelope=None, command=None, outer=None, background=False):
     )
     payload = outer or {
         "output": json.dumps(envelope or _envelope()),
-        "exit_code": 0,
+        "exit_code": exit_code,
         "error": None,
     }
     result = {
@@ -96,6 +168,22 @@ def test_accepts_allowlisted_successful_foreground_current_turn(monkeypatch):
     delivery = parse_terminal_final_delivery([call], [result])
     assert delivery.message == "## Exact report"
     assert delivery.sha256 == hashlib.sha256(delivery.message.encode()).hexdigest()
+
+
+def test_accepts_material_blocked_terminal_contract(monkeypatch):
+    call, result = _pair(
+        envelope=_material_blocked_envelope(),
+        exit_code=4,
+    )
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    delivery = parse_terminal_final_delivery([call], [result])
+    assert delivery.message == "Material settlement retained"
+    assert delivery.sha256 == hashlib.sha256(
+        delivery.message.encode()
+    ).hexdigest()
 
 
 def test_accepts_nonconflicting_additive_contract_metadata(monkeypatch):

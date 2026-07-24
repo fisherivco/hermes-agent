@@ -7,6 +7,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.tool_dispatch_helpers import make_tool_result_message
 from run_agent import AIAgent
 
@@ -88,6 +90,80 @@ def _terminal_result(message):
     return json.dumps({"output": json.dumps(envelope), "exit_code": 0, "error": None})
 
 
+def _intermediate_result(state):
+    envelope = {
+        "state": state,
+        "source_key": "src_test",
+        "source_revision": "rev_test",
+        "submission_path_absolute": f"/tmp/{state.lower()}.json",
+        "next_action": "write the requested submission, then re-run",
+    }
+    return json.dumps({"output": json.dumps(envelope), "exit_code": 0, "error": None})
+
+
+def _material_blocked_result(message):
+    envelope = {
+        "state": "MATERIAL_BLOCKED_RETAINED",
+        "material_report": {
+            "state": "MATERIAL_BLOCKED_RETAINED",
+            "source_key": "src_test",
+            "draft_path": "memory/inbox/test.md",
+            "counts": {
+                "required": 1,
+                "complete": 0,
+                "pending_retryable": 0,
+                "terminal": 1,
+            },
+            "blocked_components": ["image-1"],
+            "reason": "required_material_is_terminal",
+            "semantic_authoring_allowed": False,
+            "next_action": "retain_material_state_and_stop",
+        },
+        "final_report_contract": {
+            "version": "a054.material-blocked-report.v1.verbatim",
+            "authoritative_field": "final_report_message",
+            "sha256_field": "final_report_message_sha256",
+            "encoding": "utf-8",
+            "normalization": "none",
+            "delivery": "exact_verbatim",
+            "terminal_newline": "forbidden",
+            "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+            "model_reauthoring_allowed": False,
+            "required_fields": [
+                "state",
+                "source_key",
+                "draft_path",
+                "counts",
+                "blocked_components",
+                "reason",
+                "semantic_authoring_allowed",
+                "next_action",
+            ],
+            "counts_source": "durable_material_state",
+            "success": False,
+        },
+        "final_report_message": message,
+        "final_report_message_sha256": hashlib.sha256(
+            message.encode()
+        ).hexdigest(),
+        "final_report_delivery_contract": {
+            "version": "a054.material-blocked-report-delivery.v1",
+            "authoritative_field": "final_report_message",
+            "sha256_field": "final_report_message_sha256",
+            "encoding": "utf-8",
+            "normalization": "none",
+            "mode": "exact_verbatim",
+            "preamble_allowed": False,
+            "suffix_allowed": False,
+            "translation_allowed": False,
+            "reconstruction_allowed": False,
+            "terminal_newline": "forbidden",
+            "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+        },
+    }
+    return json.dumps({"output": json.dumps(envelope), "exit_code": 4, "error": None})
+
+
 def test_qualifying_terminal_result_exits_before_second_model_call(monkeypatch):
     agent = _make_agent()
     call = _call()
@@ -122,6 +198,139 @@ def test_qualifying_terminal_result_exits_before_second_model_call(monkeypatch):
     assert cleanup.call_count == 1
     assert trajectory.call_count == 1
     assert agent._stream_callback is None
+
+
+def test_material_blocked_terminal_result_exits_before_second_model_call(
+    monkeypatch,
+):
+    agent = _make_agent()
+    call = _call()
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        AssertionError("second model request must not occur"),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                _material_blocked_result("Material settlement retained"),
+                "call-1",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["final_response"] == "Material settlement retained"
+    assert result["final_delivery"]["message"] == "Material settlement retained"
+    assert result["turn_exit_reason"] == "exact_delivery_success"
+    assert result["completed"] is True
+    assert result["failed"] is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["SUMMARY_REQUEST_READY", "SYNTHESIS_REQUEST_READY"],
+)
+def test_declared_intermediate_result_continues_with_current_tool_result(
+    monkeypatch,
+    state,
+):
+    agent = _make_agent()
+    call = _call()
+    tool_content = _intermediate_result(state)
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        _response(
+            content=f"continued after {state}",
+            tool_calls=None,
+            finish_reason="stop",
+        ),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message("terminal", tool_content, "call-1")
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 2
+    second_messages = (
+        agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    )
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-1"
+        and message.get("content") == tool_content
+        for message in second_messages
+    )
+    assert result["final_response"] == f"continued after {state}"
+    assert result["turn_exit_reason"] != "exact_delivery_refused"
+    assert "final_delivery" not in result
+    assert not any(
+        message.get("role") == "assistant"
+        and str(message.get("content", "")).startswith("Exact delivery refused:")
+        for message in result["messages"]
+    )
+
+
+def test_non_declared_launcher_state_still_refuses_without_model_fallback(
+    monkeypatch,
+):
+    agent = _make_agent()
+    call = _call()
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        AssertionError("non-declared state must not reach a second model request"),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                _intermediate_result("PAIR_READY"),
+                "call-1",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "exact_delivery_refused"
+    assert result["final_response"].startswith("Exact delivery refused:")
+    assert result["failed"] is True
 
 
 def test_exact_delivery_refuses_when_final_persistence_fails(monkeypatch):
