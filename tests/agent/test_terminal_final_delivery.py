@@ -8,6 +8,7 @@ import pytest
 
 from agent.final_delivery import (
     FinalDeliveryError,
+    parse_declared_failure_report,
     parse_declared_intermediate_state,
     parse_terminal_final_delivery,
 )
@@ -64,6 +65,24 @@ def _envelope(message: str = "## Exact report") -> dict:
             "terminal_newline": "forbidden",
         },
     }
+
+
+def test_delivers_truthful_acquisition_failure_report(monkeypatch):
+    call, result = _pair(
+        envelope={
+            "state": "ACQUISITION_BLOCKED",
+            "error": "fetch_service: draft persistence blocked: note_title_derivation_failed:UNTITLED",
+            "next_action": "report_source_failure",
+        },
+        exit_code=4,
+    )
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    report = parse_declared_failure_report([call], [result])
+    assert "note_title_derivation_failed:UNTITLED" in report.message
+    assert "report_source_failure" in report.message
 
 
 def _material_blocked_envelope(

@@ -222,6 +222,19 @@ def _extract_envelope(stdout: str) -> dict[str, Any]:
     raise FinalDeliveryError("terminal_result: verified final-report envelope missing")
 
 
+def _extract_last_json_object(stdout: str) -> dict[str, Any]:
+    candidates = [stdout]
+    candidates.extend(line for line in reversed(stdout.splitlines()) if line.strip())
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise FinalDeliveryError("terminal_result: ingest state envelope missing")
+
+
 def _validated_terminal_stdout(
     tool_calls: Iterable[Any],
     tool_results: Iterable[dict[str, Any]],
@@ -314,6 +327,28 @@ def parse_declared_intermediate_state(
             "contract: intermediate state carries terminal report fields"
         )
     return state
+
+
+def parse_declared_failure_report(
+    tool_calls: Iterable[Any],
+    tool_results: Iterable[dict[str, Any]],
+) -> FinalDelivery:
+    """Deliver a truthful report for a source-declared failure terminal."""
+    stdout, exit_code = _validated_terminal_stdout(
+        tool_calls, tool_results, allowed_exit_codes=frozenset({4})
+    )
+    envelope = _extract_last_json_object(stdout)
+    state = envelope.get("state")
+    if (state, exit_code) != ("ACQUISITION_BLOCKED", 4):
+        raise FinalDeliveryError("contract: failure report state/exit pair is unsupported")
+    error = envelope.get("error")
+    next_action = envelope.get("next_action")
+    if not isinstance(error, str) or not error.strip():
+        raise FinalDeliveryError("contract: failure report error is missing")
+    if next_action != "report_source_failure":
+        raise FinalDeliveryError("contract: failure report next_action is unsupported")
+    message = f"Source acquisition failed: {error} (next_action={next_action})"
+    return FinalDelivery(message=message, sha256=hashlib.sha256(message.encode()).hexdigest())
 
 
 def parse_terminal_final_delivery(

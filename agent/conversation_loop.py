@@ -4882,6 +4882,7 @@ def run_conversation(
                 from agent.final_delivery import (
                     FinalDeliveryError,
                     is_terminal_final_delivery_candidate,
+                    parse_declared_failure_report,
                     parse_declared_intermediate_state,
                     parse_terminal_final_delivery,
                 )
@@ -4903,6 +4904,22 @@ def run_conversation(
                     except FinalDeliveryError:
                         _intermediate_state = None
                     if _intermediate_state is None:
+                        try:
+                            _failure_report = parse_declared_failure_report(
+                                assistant_message.tool_calls,
+                                _current_results,
+                            )
+                        except FinalDeliveryError:
+                            _failure_report = None
+                        if _failure_report is not None:
+                            messages.append({
+                                "role": "assistant",
+                                "content": _failure_report.message,
+                            })
+                            final_response = _failure_report.message
+                            _typed_final_delivery = _failure_report
+                            _turn_exit_reason = "typed_failure_delivery"
+                            break
                         try:
                             _final_delivery = parse_terminal_final_delivery(
                                 assistant_message.tool_calls,
