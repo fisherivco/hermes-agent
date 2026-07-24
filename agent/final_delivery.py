@@ -25,10 +25,14 @@ INGEST_LAUNCHER_ALIASES = frozenset({
     "$HOME/fisher/shared-state/skills-hub/skills/ingest/scripts/draft-first-run",
     "${HOME}/fisher/shared-state/skills-hub/skills/ingest/scripts/draft-first-run",
 })
-INGEST_INTERMEDIATE_STATES = frozenset({
-    "SUMMARY_REQUEST_READY",
-    "SYNTHESIS_REQUEST_READY",
+INGEST_CONTINUATION_STATE_EXIT_CODES = frozenset({
+    ("SUMMARY_REQUEST_READY", 0),
+    ("SYNTHESIS_REQUEST_READY", 0),
+    ("SEMANTIC_CORRECTION_REQUIRED", 5),
 })
+INGEST_CONTINUATION_EXIT_CODES = frozenset(
+    exit_code for _state, exit_code in INGEST_CONTINUATION_STATE_EXIT_CODES
+)
 VERIFIED_FINAL_REPORT_CONTRACT = {
     "version": "a054.final-report.v2.verbatim",
     "authoritative_field": "final_report_message",
@@ -270,12 +274,16 @@ def parse_declared_intermediate_state(
     tool_calls: Iterable[Any],
     tool_results: Iterable[dict[str, Any]],
 ) -> str:
-    """Return a public ingest midstate only for a strict current-turn pair.
+    """Return a public ingest continuation only for a strict state/exit pair.
 
     Any unknown, malformed, or report-bearing state fails closed so the caller
     can route it through terminal qualification and produce a visible refusal.
     """
-    stdout, _exit_code = _validated_terminal_stdout(tool_calls, tool_results)
+    stdout, exit_code = _validated_terminal_stdout(
+        tool_calls,
+        tool_results,
+        allowed_exit_codes=INGEST_CONTINUATION_EXIT_CODES,
+    )
     candidates = [stdout]
     candidates.extend(line for line in reversed(stdout.splitlines()) if line.strip())
     envelope: dict[str, Any] | None = None
@@ -291,8 +299,10 @@ def parse_declared_intermediate_state(
         raise FinalDeliveryError("terminal_result: ingest state envelope missing")
 
     state = envelope.get("state")
-    if state not in INGEST_INTERMEDIATE_STATES:
-        raise FinalDeliveryError("contract: declared intermediate state missing")
+    if (state, exit_code) not in INGEST_CONTINUATION_STATE_EXIT_CODES:
+        raise FinalDeliveryError(
+            "contract: source-declared continuation state/exit pair missing"
+        )
     forbidden_report_fields = {
         "final_report_message",
         "final_report_message_sha256",

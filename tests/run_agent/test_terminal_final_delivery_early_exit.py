@@ -101,6 +101,52 @@ def _intermediate_result(state):
     return json.dumps({"output": json.dumps(envelope), "exit_code": 0, "error": None})
 
 
+def _semantic_correction_result(*, state="SEMANTIC_CORRECTION_REQUIRED"):
+    envelope = {
+        "correction": {
+            "accepted_response_committed": False,
+            "code": "semantic_contract_invalid",
+            "expected": {
+                "additional_properties": False,
+                "properties": {
+                    "summary_text": {
+                        "min_length": 1,
+                        "type": "string",
+                    },
+                },
+                "required": ["summary_text"],
+                "type": "object",
+            },
+            "field_path": "$",
+            "message": (
+                "rev_7e1debb82977dfa4d08b.json has the wrong fields "
+                "(extra=payload_type,schema)"
+            ),
+            "operation": "quick_summary",
+            "request_id": "req_8763aabf9952ae979a9e163a",
+            "run_id": "run_1957be144b0a7f805daf7b00",
+            "schema": "draft-first.semantic-correction.v1",
+            "submission_path": (
+                "memory/ingest-state/semantic-exchange/submissions/quick_summary/"
+                "src_fb99cede4f3550b4909f/rev_7e1debb82977dfa4d08b.json"
+            ),
+        },
+        "error": (
+            "SemanticCorrectionRequired: rev_7e1debb82977dfa4d08b.json has "
+            "the wrong fields (extra=payload_type,schema)"
+        ),
+        "next_action": "replace_submission_payload_then_resume_same_public_request",
+        "rc": 5,
+        "schema": "draft-first.run-result.v1",
+        "state": state,
+    }
+    return json.dumps({
+        "output": json.dumps(envelope),
+        "exit_code": 5,
+        "error": None,
+    })
+
+
 def _material_blocked_result(message):
     envelope = {
         "state": "MATERIAL_BLOCKED_RETAINED",
@@ -294,6 +340,129 @@ def test_declared_intermediate_result_continues_with_current_tool_result(
         and str(message.get("content", "")).startswith("Exact delivery refused:")
         for message in result["messages"]
     )
+
+
+def test_live_semantic_correction_result_continues_with_current_tool_result(
+    monkeypatch,
+):
+    agent = _make_agent()
+    call = _call()
+    tool_content = _semantic_correction_result()
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        _response(
+            content="repaired semantic submission and resumed",
+            tool_calls=None,
+            finish_reason="stop",
+        ),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message("terminal", tool_content, "call-1")
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 2
+    second_messages = (
+        agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    )
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-1"
+        and message.get("content") == tool_content
+        for message in second_messages
+    )
+    assert result["final_response"] == "repaired semantic submission and resumed"
+    assert result["turn_exit_reason"] != "exact_delivery_refused"
+    assert "final_delivery" not in result
+    assert not any(
+        message.get("role") == "assistant"
+        and str(message.get("content", "")).startswith("Exact delivery refused:")
+        for message in result["messages"]
+    )
+
+
+def test_unknown_state_at_exit_five_refuses_without_model_fallback(monkeypatch):
+    agent = _make_agent()
+    call = _call()
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        AssertionError("exit code alone must not reach a second model request"),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                _semantic_correction_result(state="UNKNOWN_RETRY_READY"),
+                "call-1",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "exact_delivery_refused"
+    assert result["final_response"].startswith("Exact delivery refused:")
+    assert result["failed"] is True
+
+
+def test_semantic_correction_with_final_report_fields_refuses(monkeypatch):
+    agent = _make_agent()
+    call = _call()
+    correction = json.loads(_semantic_correction_result())
+    envelope = json.loads(correction["output"])
+    envelope["final_report_message"] = "must not be accepted"
+    correction["output"] = json.dumps(envelope)
+    tool_content = json.dumps(correction)
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        AssertionError("report-bearing correction must not reach a second model request"),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message("terminal", tool_content, "call-1")
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "exact_delivery_refused"
+    assert result["final_response"].startswith("Exact delivery refused:")
+    assert result["failed"] is True
 
 
 def test_non_declared_launcher_state_still_refuses_without_model_fallback(

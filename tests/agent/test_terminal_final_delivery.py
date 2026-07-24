@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.final_delivery import FinalDeliveryError, parse_terminal_final_delivery
+from agent.final_delivery import (
+    FinalDeliveryError,
+    parse_declared_intermediate_state,
+    parse_terminal_final_delivery,
+)
 
 
 LAUNCHER = "/Users/fisherivco/fisher/shared-state/skills-hub/skills/ingest/scripts/draft-first-run"
@@ -127,6 +131,47 @@ def _material_blocked_envelope(
     }
 
 
+def _semantic_correction_envelope() -> dict:
+    return {
+        "correction": {
+            "accepted_response_committed": False,
+            "code": "semantic_contract_invalid",
+            "expected": {
+                "additional_properties": False,
+                "properties": {
+                    "summary_text": {
+                        "min_length": 1,
+                        "type": "string",
+                    },
+                },
+                "required": ["summary_text"],
+                "type": "object",
+            },
+            "field_path": "$",
+            "message": (
+                "rev_7e1debb82977dfa4d08b.json has the wrong fields "
+                "(extra=payload_type,schema)"
+            ),
+            "operation": "quick_summary",
+            "request_id": "req_8763aabf9952ae979a9e163a",
+            "run_id": "run_1957be144b0a7f805daf7b00",
+            "schema": "draft-first.semantic-correction.v1",
+            "submission_path": (
+                "memory/ingest-state/semantic-exchange/submissions/quick_summary/"
+                "src_fb99cede4f3550b4909f/rev_7e1debb82977dfa4d08b.json"
+            ),
+        },
+        "error": (
+            "SemanticCorrectionRequired: rev_7e1debb82977dfa4d08b.json has "
+            "the wrong fields (extra=payload_type,schema)"
+        ),
+        "next_action": "replace_submission_payload_then_resume_same_public_request",
+        "rc": 5,
+        "schema": "draft-first.run-result.v1",
+        "state": "SEMANTIC_CORRECTION_REQUIRED",
+    }
+
+
 def _pair(
     *,
     envelope=None,
@@ -157,6 +202,73 @@ def _pair(
         "content": json.dumps(payload),
     }
     return call, result
+
+
+def test_accepts_source_declared_semantic_correction_continuation(monkeypatch):
+    call, result = _pair(
+        envelope=_semantic_correction_envelope(),
+        exit_code=5,
+    )
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    assert parse_declared_intermediate_state([call], [result]) == (
+        "SEMANTIC_CORRECTION_REQUIRED"
+    )
+
+
+def test_rejects_unknown_state_at_continue_class_exit_code(monkeypatch):
+    envelope = _semantic_correction_envelope()
+    envelope["state"] = "UNKNOWN_RETRY_READY"
+    call, result = _pair(envelope=envelope, exit_code=5)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="continuation state"):
+        parse_declared_intermediate_state([call], [result])
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code"),
+    [
+        ("SUMMARY_REQUEST_READY", 5),
+        ("SYNTHESIS_REQUEST_READY", 5),
+        ("SEMANTIC_CORRECTION_REQUIRED", 0),
+    ],
+)
+def test_rejects_continue_state_exit_code_mismatch(
+    monkeypatch,
+    state,
+    exit_code,
+):
+    envelope = _semantic_correction_envelope()
+    envelope["state"] = state
+    envelope["rc"] = exit_code
+    call, result = _pair(envelope=envelope, exit_code=exit_code)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="continuation state"):
+        parse_declared_intermediate_state([call], [result])
+
+
+def test_rejects_semantic_correction_with_terminal_report_fields(monkeypatch):
+    envelope = _semantic_correction_envelope()
+    envelope["final_report_message"] = "must not be accepted"
+    call, result = _pair(envelope=envelope, exit_code=5)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="terminal report fields"):
+        parse_declared_intermediate_state([call], [result])
 
 
 def test_accepts_allowlisted_successful_foreground_current_turn(monkeypatch):
