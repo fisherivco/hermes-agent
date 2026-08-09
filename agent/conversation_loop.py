@@ -6765,6 +6765,7 @@ def run_conversation(
                     except Exception:
                         pass
 
+                current_tool_result_start = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
@@ -6821,7 +6822,7 @@ def run_conversation(
                     }
                     current_results = [
                         message
-                        for message in messages
+                        for message in messages[current_tool_result_start:]
                         if isinstance(message, dict)
                         and message.get("role") == "tool"
                         and message.get("tool_call_id") in current_call_ids

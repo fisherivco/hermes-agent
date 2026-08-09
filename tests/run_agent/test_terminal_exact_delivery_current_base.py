@@ -141,6 +141,67 @@ def test_qualifying_terminal_result_exits_before_model_reauthors_bytes(
     assert result["turn_exit_reason"] == "exact_delivery_success"
 
 
+def test_historical_duplicate_call_id_cannot_enter_current_turn(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    call = _call()
+    agent.client.chat.completions.create.return_value = _response(tool_calls=[call])
+    history = [
+        {"role": "user", "content": "prior request"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": json.dumps(
+                            {"command": f'"{LAUNCHER}" "https://old.test/source"'}
+                        ),
+                    },
+                }
+            ],
+        },
+        make_tool_result_message(
+            "terminal",
+            _terminal_result("stale payload"),
+            "call-1",
+        ),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                _terminal_result("current payload"),
+                "call-1",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "ingest current source",
+            conversation_history=history,
+        )
+
+    assert result["final_response"] == "current payload"
+    assert result["final_delivery"]["message"] == "current payload"
+    assert result["turn_exit_reason"] == "exact_delivery_success"
+
+
 def test_nonqualifying_terminal_command_keeps_ordinary_model_path(tmp_path) -> None:
     agent = _make_agent(tmp_path)
     call = _call("printf ordinary")
