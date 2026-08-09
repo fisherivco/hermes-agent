@@ -135,6 +135,19 @@ def test_accepts_observed_multistage_current_turn_shape(monkeypatch) -> None:
             ),
             "background",
         ),
+        (
+            lambda call, result: setattr(
+                call.function,
+                "arguments",
+                json.dumps(
+                    {
+                        "command": f'"{LAUNCHER}" "https://example.test/source"',
+                        "background": "true",
+                    }
+                ),
+            ),
+            "background",
+        ),
     ],
 )
 def test_rejects_nonterminal_stale_or_background_result(
@@ -159,6 +172,9 @@ def test_rejects_nonterminal_stale_or_background_result(
         lambda envelope: envelope.update(final_report_message_sha256="0" * 64),
         lambda envelope: envelope["final_report_delivery_contract"].update(
             preamble_allowed=True
+        ),
+        lambda envelope: envelope["final_report_delivery_contract"].update(
+            preamble_allowed=0
         ),
         lambda envelope: envelope.update(state="PAIR_READY"),
         lambda envelope: envelope.update(final_report_message="ends with newline\n"),
@@ -198,6 +214,71 @@ def test_rejects_ambiguous_current_turn(monkeypatch) -> None:
 
     with pytest.raises(FinalDeliveryError, match="current_turn"):
         parse_terminal_final_delivery([call], [result, duplicate])
+
+
+def test_rejects_missing_call_identity_even_if_result_identity_is_missing(
+    monkeypatch,
+) -> None:
+    call, result = _pair()
+    call.id = None
+    result["tool_call_id"] = None
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="current_turn"):
+        parse_terminal_final_delivery([call], [result])
+
+
+def test_rejects_boolean_exit_code(monkeypatch) -> None:
+    call, result = _pair()
+    wrapper = json.loads(result["content"])
+    wrapper["exit_code"] = False
+    result["content"] = json.dumps(wrapper)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="terminal_result"):
+        parse_terminal_final_delivery([call], [result])
+
+
+def test_rejects_non_utf8_scalar_message(monkeypatch) -> None:
+    envelope = _envelope()
+    envelope["final_report_message"] = "\ud800"
+    envelope["final_report_message_sha256"] = "0" * 64
+    call, result = _pair(envelope=envelope)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="UTF-8"):
+        parse_terminal_final_delivery([call], [result])
+
+
+def test_rejects_multiple_final_envelopes_in_one_terminal_stdout(
+    monkeypatch,
+) -> None:
+    call, result = _pair()
+    wrapper = json.loads(result["content"])
+    wrapper["output"] = "\n".join(
+        (
+            json.dumps({"state": "SUMMARY_READY"}),
+            json.dumps(_envelope("first payload")),
+            json.dumps(_envelope("second payload")),
+        )
+    )
+    result["content"] = json.dumps(wrapper)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="ambiguous"):
+        parse_terminal_final_delivery([call], [result])
 
 
 def test_candidate_gate_is_narrow_but_refusal_attempts_remain_visible() -> None:

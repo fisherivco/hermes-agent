@@ -148,25 +148,42 @@ def is_terminal_final_delivery_candidate(tool_calls: Iterable[Any]) -> bool:
 
 def _contains_required_contract(actual: Any, required: dict[str, Any]) -> bool:
     return isinstance(actual, dict) and all(
-        key in actual and actual[key] == value for key, value in required.items()
+        key in actual
+        and type(actual[key]) is type(value)
+        and actual[key] == value
+        for key, value in required.items()
     )
 
 
 def _extract_envelope(stdout: str) -> dict[str, Any]:
     if not isinstance(stdout, str) or not stdout:
         raise FinalDeliveryError("terminal_result: stdout is empty")
-    candidates = [stdout]
-    candidates.extend(line for line in reversed(stdout.splitlines()) if line.strip())
-    for candidate in candidates:
+    try:
+        whole = json.loads(stdout)
+    except (TypeError, ValueError):
+        whole = None
+    if isinstance(whole, dict) and "final_report_delivery_contract" in whole:
+        return whole
+
+    envelopes: list[dict[str, Any]] = []
+    for candidate in stdout.splitlines():
+        if not candidate.strip():
+            continue
         try:
             parsed = json.loads(candidate)
         except (TypeError, ValueError):
             continue
         if isinstance(parsed, dict) and "final_report_delivery_contract" in parsed:
-            return parsed
-    raise FinalDeliveryError(
-        "terminal_result: verified final-report envelope is missing"
-    )
+            envelopes.append(parsed)
+    if not envelopes:
+        raise FinalDeliveryError(
+            "terminal_result: verified final-report envelope is missing"
+        )
+    if len(envelopes) != 1:
+        raise FinalDeliveryError(
+            "terminal_result: final-report envelope is ambiguous"
+        )
+    return envelopes[0]
 
 
 def parse_terminal_final_delivery(
@@ -185,12 +202,15 @@ def parse_terminal_final_delivery(
     arguments = _call_arguments(call)
     command = arguments.get("command")
     _parse_command(command)
-    if arguments.get("background", False) is True:
+    background = arguments.get("background", False)
+    if not isinstance(background, bool) or background:
         raise FinalDeliveryError(
             "background: exact delivery requires foreground execution"
         )
 
     call_id = _call_attr(call, "id")
+    if not isinstance(call_id, str) or not call_id:
+        raise FinalDeliveryError("current_turn: terminal call identity is missing")
     matching_results = [
         result
         for result in results
@@ -210,7 +230,12 @@ def parse_terminal_final_delivery(
         raise FinalDeliveryError("terminal_result: wrapper is malformed") from exc
     if not isinstance(wrapper, dict):
         raise FinalDeliveryError("terminal_result: wrapper must be an object")
-    if wrapper.get("exit_code") != 0 or wrapper.get("error") is not None:
+    exit_code = wrapper.get("exit_code")
+    if (
+        type(exit_code) is not int
+        or exit_code != 0
+        or wrapper.get("error") is not None
+    ):
         raise FinalDeliveryError(
             "terminal_result: terminal execution was not successful"
         )
@@ -251,7 +276,13 @@ def parse_terminal_final_delivery(
         or any(character not in "0123456789abcdef" for character in digest)
     ):
         raise FinalDeliveryError("contract: final_report_message SHA is malformed")
-    computed = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    try:
+        encoded_message = message.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise FinalDeliveryError(
+            "contract: final_report_message is not valid UTF-8"
+        ) from exc
+    computed = hashlib.sha256(encoded_message).hexdigest()
     if digest != computed:
         raise FinalDeliveryError("contract: final_report_message SHA mismatch")
     return FinalDelivery(message=message, sha256=digest)
