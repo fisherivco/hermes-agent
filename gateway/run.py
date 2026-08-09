@@ -702,6 +702,72 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+_TYPED_FINAL_DELIVERY_REFUSAL = (
+    "Exact delivery refused: the typed payload failed validation."
+)
+
+
+def _typed_final_delivery_or_fallback(
+    agent_result: dict,
+    current_response: str,
+) -> str:
+    """Project a validated top-level exact-delivery payload at the last seam."""
+    try:
+        config = _load_gateway_config()
+        gateway_config = config.get("gateway", {}) if isinstance(config, dict) else {}
+        if not isinstance(gateway_config, dict):
+            return current_response
+        if gateway_config.get("verbatim_delivery_enabled") is not True:
+            return current_response
+        if agent_result.get("already_sent") or "final_delivery" not in agent_result:
+            return current_response
+
+        delivery = agent_result.get("final_delivery")
+        if not isinstance(delivery, dict):
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        message = delivery.get("message")
+        digest = delivery.get("sha256")
+        if (
+            not isinstance(message, str)
+            or not message.strip()
+            or message.endswith(("\n", "\r"))
+        ):
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+
+        import hashlib as _hashlib
+
+        if _hashlib.sha256(message.encode("utf-8")).hexdigest() != digest:
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        if _redact_gateway_user_facing_secrets(message) != message:
+            logger.error(
+                "typed exact delivery refused: mandatory redaction changed bytes"
+            )
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+
+        from gateway.platforms.base import ExactDeliveryReply
+
+        logger.info(
+            "typed exact delivery selected: sha=%s chars=%d",
+            digest[:12],
+            len(message),
+        )
+        return ExactDeliveryReply(message, declared_sha256=digest)
+    except Exception as exc:
+        logger.error("typed exact delivery refused: %s", exc)
+        if isinstance(agent_result, dict) and "final_delivery" in agent_result:
+            return _TYPED_FINAL_DELIVERY_REFUSAL
+        return current_response
+
+
+# S7S_PATCH_MARKER: a054-gateway-verbatim-delivery-v1-current-base
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -18624,10 +18690,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
             if (
-                not _streaming_tts_done
+                "final_delivery" not in agent_result
+                and not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
                 await self._send_voice_reply(event, response)
+
+            # A typed exact result and an already-sent stream are mutually
+            # exclusive. Refuse without additional outbound side effects.
+            if "final_delivery" in agent_result and _already_sent:
+                logger.error(
+                    "typed exact delivery refused: already_sent is incompatible"
+                )
+                return None
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -18663,6 +18738,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
+
+            # Exact delivery is the final response projection. All ordinary
+            # sanitizer, reasoning, footer, and media decisions have already
+            # run; the typed wrapper tells the platform layer not to mutate it.
+            response = _typed_final_delivery_or_fallback(agent_result, response)
 
             return response
             

@@ -2660,6 +2660,17 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class ExactDeliveryReply(str):
+    """Typed transport bridge for SHA-verified byte-exact delivery."""
+
+    declared_sha256: str
+
+    def __new__(cls, text: str, declared_sha256: str):
+        instance = super().__new__(cls, text)
+        instance.declared_sha256 = declared_sha256
+        return instance
+
+
 def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     """Clear gateway-side STT cache attrs when media is merged into an event.
 
@@ -5445,6 +5456,19 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
+
+        # Chat sends are not idempotent. An exact multi-chunk send can fail
+        # after an earlier chunk reached the platform, so retrying the whole
+        # body can duplicate a verified prefix and break ordered-body identity.
+        # Preserve the failure for the delivery ledger and operator recovery.
+        if isinstance(metadata, dict) and metadata.get("exact_delivery") is True:
+            logger.error(
+                "[%s] Exact delivery failed; automatic retry is disabled: %s",
+                self.name,
+                error_str,
+            )
+            return result
+
         is_network = result.retryable or self._is_retryable_error(error_str)
 
         # Timeout errors are not safe to retry (message may have been
@@ -6214,6 +6238,10 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+            is_exact_delivery = isinstance(response, ExactDeliveryReply)
+            exact_delivery_sha256 = (
+                response.declared_sha256 if is_exact_delivery else None
+            )
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -6251,27 +6279,38 @@ class BasePlatformAdapter(ABC):
                 # through send_document instead of send_multiple_images. Used
                 # by skills that produce large/lossless images (e.g. info-graph)
                 # where Telegram's sendPhoto recompression destroys legibility.
-                force_document_attachments = "[[as_document]]" in response
+                force_document_attachments = (
+                    False
+                    if is_exact_delivery
+                    else "[[as_document]]" in response
+                )
 
                 # Pre-extract snapshot for the #29346 recovery/invariant below.
                 _response_pre_extract = response
 
-                # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                if is_exact_delivery:
+                    # No media directives, formatting, stripping, or path
+                    # discovery may reinterpret exact-delivery bytes.
+                    media_files = []
+                    images = []
+                    text_content = str(response)
+                else:
+                    # Extract MEDIA:<path> tags (from TTS tool) before other processing
+                    media_files, response = self.extract_media(response)
+                    media_files = self.filter_media_delivery_paths(media_files)
 
-                # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
-                # Strip any remaining internal directives from message body (fixes #1561).
-                # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
-                # with an unknown extension is intentionally left in the body for
-                # extract_local_files below to pick up rather than silently dropped (#34517).
-                text_content = _strip_media_directives(text_content).strip()
-                if images:
-                    logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
+                    # Extract image URLs and send them as native platform attachments
+                    images, text_content = self.extract_images(response)
+                    # Strip any remaining internal directives from message body (fixes #1561).
+                    # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
+                    # with an unknown extension is intentionally left in the body for
+                    # extract_local_files below to pick up rather than silently dropped (#34517).
+                    text_content = _strip_media_directives(text_content).strip()
+                    if images:
+                        logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
                 local_files = []
-                if not is_ephemeral_response:
+                if not is_ephemeral_response and not is_exact_delivery:
                     # Auto-detect bare local file paths for native media delivery
                     # (helps small models that don't use MEDIA: syntax). Skip
                     # system/command notices so config paths stay visible text
@@ -6329,6 +6368,11 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if is_exact_delivery:
+                    _final_thread_metadata["exact_delivery"] = True
+                    _final_thread_metadata[
+                        "exact_delivery_sha256"
+                    ] = exact_delivery_sha256
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -6343,6 +6387,7 @@ class BasePlatformAdapter(ABC):
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
+                        and not is_exact_delivery
                         and not self._streaming_tts_turn_completed(
                             session_key,
                             getattr(interrupt_event, "_hermes_run_generation", None),
