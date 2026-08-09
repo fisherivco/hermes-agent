@@ -5456,6 +5456,19 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
+
+        # Chat sends are not idempotent. An exact multi-chunk send can fail
+        # after an earlier chunk reached the platform, so retrying the whole
+        # body can duplicate a verified prefix and break ordered-body identity.
+        # Preserve the failure for the delivery ledger and operator recovery.
+        if isinstance(metadata, dict) and metadata.get("exact_delivery") is True:
+            logger.error(
+                "[%s] Exact delivery failed; automatic retry is disabled: %s",
+                self.name,
+                error_str,
+            )
+            return result
+
         is_network = result.retryable or self._is_retryable_error(error_str)
 
         # Timeout errors are not safe to retry (message may have been
@@ -5505,11 +5518,6 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
-
-        # Exact delivery may retry the same bytes after a transient failure,
-        # but must never prepend or truncate through the formatting fallback.
-        if isinstance(metadata, dict) and metadata.get("exact_delivery") is True:
-            return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)

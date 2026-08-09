@@ -327,6 +327,36 @@ async def test_discord_exact_delivery_rejects_altered_returned_chunk() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exact_partial_send_is_never_retried_as_a_full_duplicate(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    async def wire_send(*, content, reference=None, allowed_mentions=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ConnectionError("ConnectionError: reset by peer")
+        return SimpleNamespace(id=f"m-{calls}", content=content)
+
+    adapter = _discord_adapter(SimpleNamespace(type=0, send=wire_send))
+    report = "x" * 2100
+    digest = hashlib.sha256(report.encode()).hexdigest()
+    monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", AsyncMock())
+
+    result = await adapter._send_with_retry(
+        "42",
+        report,
+        metadata={"exact_delivery": True, "exact_delivery_sha256": digest},
+        max_retries=1,
+        base_delay=0,
+    )
+
+    assert result.success is False
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_discord_exact_delivery_refuses_forum_mutation() -> None:
     forum = SimpleNamespace(type=15, id=999, create_thread=AsyncMock())
     adapter = _discord_adapter(forum)
