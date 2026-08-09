@@ -255,4 +255,3 @@ def parse_terminal_final_delivery(
     if digest != computed:
         raise FinalDeliveryError("contract: final_report_message SHA mismatch")
     return FinalDelivery(message=message, sha256=digest)
-
