@@ -3083,6 +3083,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 thread_id = metadata["thread_id"]
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
+            exact_delivery = bool(
+                metadata and metadata.get("exact_delivery") is True
+            )
+            exact_delivery_sha256 = (
+                metadata.get("exact_delivery_sha256", "")
+                if isinstance(metadata, dict)
+                else ""
+            )
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
@@ -3101,6 +3109,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
+                if exact_delivery:
+                    result = SendResult(
+                        success=False,
+                        error="exact_delivery is incompatible with forum channels",
+                    )
+                    await asyncio.to_thread(
+                        self._record_discord_response,
+                        reply_to=reply_to,
+                        result=result,
+                        content=content,
+                        final=final_delivery,
+                    )
+                    return result
                 result = await self._send_to_forum(channel, content)
                 await asyncio.to_thread(
                     self._record_discord_response,
@@ -3111,11 +3132,56 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 return result
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if exact_delivery:
+                if (
+                    not isinstance(exact_delivery_sha256, str)
+                    or len(exact_delivery_sha256) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in exact_delivery_sha256
+                    )
+                ):
+                    result = SendResult(
+                        success=False,
+                        error="exact_delivery requires a valid hex64 SHA",
+                    )
+                    await asyncio.to_thread(
+                        self._record_discord_response,
+                        reply_to=reply_to,
+                        result=result,
+                        content=content,
+                        final=final_delivery,
+                    )
+                    return result
+                chunks = self._split_only_raw(content, self.MAX_MESSAGE_LENGTH)
+                import hashlib as _hashlib
+
+                joined_sha256 = _hashlib.sha256(
+                    "".join(chunks).encode("utf-8")
+                ).hexdigest()
+                if joined_sha256 != exact_delivery_sha256:
+                    result = SendResult(
+                        success=False,
+                        error="exact_delivery last-hop SHA mismatch",
+                    )
+                    await asyncio.to_thread(
+                        self._record_discord_response,
+                        reply_to=reply_to,
+                        result=result,
+                        content=content,
+                        final=final_delivery,
+                    )
+                    return result
+            else:
+                # Ordinary Discord delivery may format and indicator-split.
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(
+                    formatted,
+                    self.MAX_MESSAGE_LENGTH,
+                )
 
             message_ids = []
+            returned_chunks: list[str] = []
             # Build the reference from ids — no fetch_message round trip.
             reference = self._reply_reference_for_send(reply_to, channel)
 
@@ -3125,10 +3191,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if exact_delivery:
+                        send_kwargs["allowed_mentions"] = discord.AllowedMentions(
+                            everyone=False,
+                            users=False,
+                            roles=False,
+                            replied_user=False,
+                        )
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3147,13 +3221,56 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        send_kwargs["reference"] = None
+                        msg = await channel.send(**send_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                if exact_delivery:
+                    returned = getattr(msg, "content", None)
+                    if not isinstance(returned, str) or returned != chunk:
+                        result = SendResult(
+                            success=False,
+                            error=(
+                                "exact_delivery returned content mismatch "
+                                f"at chunk {i}"
+                            ),
+                            raw_response={"message_ids": message_ids},
+                        )
+                        await asyncio.to_thread(
+                            self._record_discord_response,
+                            reply_to=reply_to,
+                            result=result,
+                            content=content,
+                            final=final_delivery,
+                        )
+                        return result
+                    returned_chunks.append(returned)
+
+            returned_content = ""
+            returned_sha256 = ""
+            if exact_delivery:
+                returned_content = "".join(returned_chunks)
+                returned_sha256 = _hashlib.sha256(
+                    returned_content.encode("utf-8")
+                ).hexdigest()
+                if (
+                    returned_content != content
+                    or returned_sha256 != exact_delivery_sha256
+                ):
+                    result = SendResult(
+                        success=False,
+                        error="exact_delivery ordered returned content mismatch",
+                        raw_response={"message_ids": message_ids},
+                    )
+                    await asyncio.to_thread(
+                        self._record_discord_response,
+                        reply_to=reply_to,
+                        result=result,
+                        content=content,
+                        final=final_delivery,
+                    )
+                    return result
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -3167,7 +3284,17 @@ class DiscordAdapter(BasePlatformAdapter):
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response={
+                    "message_ids": message_ids,
+                    **(
+                        {
+                            "returned_content": returned_content,
+                            "returned_content_sha256": returned_sha256,
+                        }
+                        if exact_delivery
+                        else {}
+                    ),
+                },
             )
             await asyncio.to_thread(
                 self._record_discord_response,
@@ -5364,6 +5491,26 @@ class DiscordAdapter(BasePlatformAdapter):
             os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
         if resolved_count:
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
+
+    @staticmethod
+    def _split_only_raw(content: str, max_length: int) -> list[str]:
+        """Split without adding, deleting, normalizing, or reordering text."""
+        if len(content) <= max_length:
+            return [content]
+        chunks: list[str] = []
+        remaining = content
+        while remaining:
+            if len(remaining) <= max_length:
+                chunks.append(remaining)
+                break
+            split_at = remaining.rfind("\n", 0, max_length)
+            if split_at < max_length // 2:
+                split_at = remaining.rfind(" ", 0, max_length)
+            if split_at < max_length // 4:
+                split_at = max_length
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+        return chunks
 
     def format_message(self, content: str) -> str:
         """Format message for Discord.

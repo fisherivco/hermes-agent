@@ -1598,6 +1598,8 @@ def run_conversation(
     # reused as the final response — not merely because any interim was
     # streamed. (#65919 review: response-loss blocker)
     _pending_verification_response_previewed = False
+    _typed_final_delivery = None
+    _exact_delivery_refusal = None
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -6797,6 +6799,60 @@ def run_conversation(
                                 pass
                     break
 
+                # A successful current-turn invocation of the canonical ingest
+                # launcher owns its final bytes. Qualify the terminal result
+                # now and stop before another provider request can re-author it.
+                from agent.final_delivery import (
+                    FinalDeliveryError,
+                    is_terminal_final_delivery_candidate,
+                    parse_terminal_final_delivery,
+                )
+
+                if is_terminal_final_delivery_candidate(
+                    assistant_message.tool_calls
+                ):
+                    current_call_ids = {
+                        (
+                            tool_call.get("id")
+                            if isinstance(tool_call, dict)
+                            else getattr(tool_call, "id", None)
+                        )
+                        for tool_call in assistant_message.tool_calls
+                    }
+                    current_results = [
+                        message
+                        for message in messages
+                        if isinstance(message, dict)
+                        and message.get("role") == "tool"
+                        and message.get("tool_call_id") in current_call_ids
+                    ]
+                    try:
+                        final_delivery = parse_terminal_final_delivery(
+                            assistant_message.tool_calls,
+                            current_results,
+                        )
+                    except FinalDeliveryError as exc:
+                        refusal = f"Exact delivery refused: {exc}"
+                        messages.append(
+                            {"role": "assistant", "content": refusal}
+                        )
+                        final_response = refusal
+                        _exact_delivery_refusal = refusal
+                        failed = True
+                        _turn_exit_reason = "exact_delivery_refused"
+                        break
+
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": final_delivery.message,
+                        }
+                    )
+                    final_response = final_delivery.message
+                    _typed_final_delivery = final_delivery
+                    _turn_exit_reason = "exact_delivery_success"
+                    break
+
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
                 # entire conversation.
@@ -7717,7 +7773,7 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -7734,6 +7790,27 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
+    if _typed_final_delivery is not None:
+        persistence_failed = any(
+            isinstance(error, str) and error.startswith("persist_session:")
+            for error in result.get("cleanup_errors", ())
+        )
+        if persistence_failed:
+            result["final_response"] = (
+                "Exact delivery refused: the exact response could not be "
+                "durably persisted."
+            )
+            result["completed"] = False
+            result["failed"] = True
+            result["turn_exit_reason"] = "exact_delivery_refused"
+            return result
+        result["final_response"] = _typed_final_delivery.message
+        result["final_delivery"] = _typed_final_delivery.as_dict()
+        result["response_transformed"] = False
+        result["pre_transform_response"] = None
+    elif _exact_delivery_refusal is not None:
+        result["final_response"] = _exact_delivery_refusal
+    return result
 
 
 
