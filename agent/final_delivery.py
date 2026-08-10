@@ -27,6 +27,16 @@ INGEST_LAUNCHER_ALIASES = frozenset(
         f"${{HOME}}/{INGEST_LAUNCHER_RELATIVE}",
     }
 )
+INGEST_CONTINUATION_STATE_EXIT_CODES = frozenset(
+    {
+        ("SUMMARY_REQUEST_READY", 0),
+        ("SYNTHESIS_REQUEST_READY", 0),
+        ("SEMANTIC_CORRECTION_REQUIRED", 5),
+    }
+)
+INGEST_CONTINUATION_EXIT_CODES = frozenset(
+    exit_code for _state, exit_code in INGEST_CONTINUATION_STATE_EXIT_CODES
+)
 
 VERIFIED_FINAL_REPORT_CONTRACT = {
     "version": "a054.final-report.v2.verbatim",
@@ -186,11 +196,12 @@ def _extract_envelope(stdout: str) -> dict[str, Any]:
     return envelopes[0]
 
 
-def parse_terminal_final_delivery(
+def _validated_terminal_stdout(
     tool_calls: Iterable[Any],
     tool_results: Iterable[dict[str, Any]],
-) -> FinalDelivery:
-    """Return immutable exact bytes only when every current-turn gate passes."""
+    *,
+    allowed_exit_codes: frozenset[int],
+) -> tuple[str, int]:
     calls = list(tool_calls or [])
     results = list(tool_results or [])
     if len(calls) != 1:
@@ -233,7 +244,7 @@ def parse_terminal_final_delivery(
     exit_code = wrapper.get("exit_code")
     if (
         type(exit_code) is not int
-        or exit_code != 0
+        or exit_code not in allowed_exit_codes
         or wrapper.get("error") is not None
     ):
         raise FinalDeliveryError(
@@ -246,6 +257,66 @@ def parse_terminal_final_delivery(
         raise FinalDeliveryError(
             "redaction: forced redaction would alter terminal stdout"
         )
+    return stdout, exit_code
+
+
+def parse_declared_intermediate_state(
+    tool_calls: Iterable[Any],
+    tool_results: Iterable[dict[str, Any]],
+) -> str:
+    """Return only an exact declared ingest continuation state/exit pair."""
+    stdout, exit_code = _validated_terminal_stdout(
+        tool_calls,
+        tool_results,
+        allowed_exit_codes=INGEST_CONTINUATION_EXIT_CODES,
+    )
+    try:
+        whole = json.loads(stdout)
+    except (TypeError, ValueError):
+        whole = None
+    envelopes: list[dict[str, Any]] = []
+    if isinstance(whole, dict):
+        envelopes.append(whole)
+    else:
+        candidates = (line for line in stdout.splitlines() if line.strip())
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                envelopes.append(parsed)
+    if not envelopes:
+        raise FinalDeliveryError("terminal_result: ingest state envelope is missing")
+
+    terminal_report_fields = {
+        "final_report_message",
+        "final_report_message_sha256",
+        "final_report_contract",
+        "final_report_delivery_contract",
+    }
+    if any(terminal_report_fields.intersection(item) for item in envelopes):
+        raise FinalDeliveryError(
+            "contract: continuation output carries terminal report fields"
+        )
+
+    envelope = envelopes[-1]
+    pair = (envelope.get("state"), exit_code)
+    if pair not in INGEST_CONTINUATION_STATE_EXIT_CODES:
+        raise FinalDeliveryError("contract: declared continuation pair is missing")
+    return pair[0]
+
+
+def parse_terminal_final_delivery(
+    tool_calls: Iterable[Any],
+    tool_results: Iterable[dict[str, Any]],
+) -> FinalDelivery:
+    """Return immutable exact bytes only when every current-turn gate passes."""
+    stdout, _exit_code = _validated_terminal_stdout(
+        tool_calls,
+        tool_results,
+        allowed_exit_codes=frozenset({0}),
+    )
 
     envelope = _extract_envelope(stdout)
     if envelope.get("state") != "VERIFIED":
