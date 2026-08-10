@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.final_delivery import (
     VERIFIED_DELIVERY_CONTRACT,
     VERIFIED_FINAL_REPORT_CONTRACT,
@@ -97,6 +99,23 @@ def _terminal_result(message: str) -> str:
         )
     )
     return json.dumps({"output": output, "exit_code": 0, "error": None})
+
+
+def _continuation_result(state: str, exit_code: int) -> str:
+    envelope = {
+        "state": state,
+        "source_key": "src_test",
+        "source_revision": "rev_test",
+        "submission_path_absolute": f"/tmp/{state.lower()}.json",
+        "next_action": "resume_same_public_request",
+    }
+    return json.dumps(
+        {
+            "output": json.dumps(envelope),
+            "exit_code": exit_code,
+            "error": None,
+        }
+    )
 
 
 def test_qualifying_terminal_result_exits_before_model_reauthors_bytes(
@@ -234,6 +253,153 @@ def test_nonqualifying_terminal_command_keeps_ordinary_model_path(tmp_path) -> N
     assert agent.client.chat.completions.create.call_count == 2
     assert result["final_response"] == "ordinary final"
     assert "final_delivery" not in result
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code"),
+    [
+        ("SUMMARY_REQUEST_READY", 0),
+        ("SYNTHESIS_REQUEST_READY", 0),
+        ("SEMANTIC_CORRECTION_REQUIRED", 5),
+    ],
+)
+def test_declared_ingest_continuation_returns_to_model_loop(
+    monkeypatch,
+    tmp_path,
+    state: str,
+    exit_code: int,
+) -> None:
+    agent = _make_agent(tmp_path)
+    call = _call()
+    tool_content = _continuation_result(state, exit_code)
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        _response(
+            content=f"continued after {state}",
+            tool_calls=None,
+            finish_reason="stop",
+        ),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message("terminal", tool_content, "call-1")
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 2
+    second_messages = (
+        agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    )
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-1"
+        and message.get("content") == tool_content
+        for message in second_messages
+    )
+    assert result["final_response"] == f"continued after {state}"
+    assert result["turn_exit_reason"] != "exact_delivery_refused"
+    assert "final_delivery" not in result
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code"),
+    [
+        ("UNKNOWN_RETRY_READY", 5),
+        ("SUMMARY_REQUEST_READY", 5),
+        ("SEMANTIC_CORRECTION_REQUIRED", 0),
+    ],
+)
+def test_undeclared_ingest_continuation_pair_still_refuses(
+    monkeypatch,
+    tmp_path,
+    state: str,
+    exit_code: int,
+) -> None:
+    agent = _make_agent(tmp_path)
+    call = _call()
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        AssertionError("an undeclared pair must not reach model fallback"),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                _continuation_result(state, exit_code),
+                "call-1",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "exact_delivery_refused"
+    assert result["final_response"].startswith("Exact delivery refused:")
+
+
+def test_report_bearing_ingest_continuation_still_refuses(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    call = _call()
+    wrapper = json.loads(_continuation_result("SUMMARY_REQUEST_READY", 0))
+    envelope = json.loads(wrapper["output"])
+    envelope["final_report_message"] = "must not bypass terminal qualification"
+    wrapper["output"] = json.dumps(envelope)
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        AssertionError("a report-bearing midstate must not reach model fallback"),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                json.dumps(wrapper),
+                "call-1",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "exact_delivery_refused"
 
 
 def test_candidate_contract_failure_refuses_without_model_fallback(

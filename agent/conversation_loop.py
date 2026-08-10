@@ -6800,12 +6800,13 @@ def run_conversation(
                                 pass
                     break
 
-                # A successful current-turn invocation of the canonical ingest
-                # launcher owns its final bytes. Qualify the terminal result
-                # now and stop before another provider request can re-author it.
+                # The canonical ingest launcher owns terminal report bytes,
+                # while declared semantic-exchange midstates stay in the
+                # normal provider loop.
                 from agent.final_delivery import (
                     FinalDeliveryError,
                     is_terminal_final_delivery_candidate,
+                    parse_declared_intermediate_state,
                     parse_terminal_final_delivery,
                 )
 
@@ -6828,31 +6829,39 @@ def run_conversation(
                         and message.get("tool_call_id") in current_call_ids
                     ]
                     try:
-                        final_delivery = parse_terminal_final_delivery(
+                        intermediate_state = parse_declared_intermediate_state(
                             assistant_message.tool_calls,
                             current_results,
                         )
-                    except FinalDeliveryError as exc:
-                        refusal = f"Exact delivery refused: {exc}"
-                        messages.append(
-                            {"role": "assistant", "content": refusal}
-                        )
-                        final_response = refusal
-                        _exact_delivery_refusal = refusal
-                        failed = True
-                        _turn_exit_reason = "exact_delivery_refused"
-                        break
+                    except FinalDeliveryError:
+                        intermediate_state = None
+                    if intermediate_state is None:
+                        try:
+                            final_delivery = parse_terminal_final_delivery(
+                                assistant_message.tool_calls,
+                                current_results,
+                            )
+                        except FinalDeliveryError as exc:
+                            refusal = f"Exact delivery refused: {exc}"
+                            messages.append(
+                                {"role": "assistant", "content": refusal}
+                            )
+                            final_response = refusal
+                            _exact_delivery_refusal = refusal
+                            failed = True
+                            _turn_exit_reason = "exact_delivery_refused"
+                            break
 
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": final_delivery.message,
-                        }
-                    )
-                    final_response = final_delivery.message
-                    _typed_final_delivery = final_delivery
-                    _turn_exit_reason = "exact_delivery_success"
-                    break
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": final_delivery.message,
+                            }
+                        )
+                        final_response = final_delivery.message
+                        _typed_final_delivery = final_delivery
+                        _turn_exit_reason = "exact_delivery_success"
+                        break
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
