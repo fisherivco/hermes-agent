@@ -402,6 +402,56 @@ def test_report_bearing_ingest_continuation_still_refuses(
     assert result["turn_exit_reason"] == "exact_delivery_refused"
 
 
+def test_terminal_report_before_continuation_line_still_delivers_exactly(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    call = _call()
+    wrapper = json.loads(_terminal_result("must remain exact"))
+    continuation = json.loads(
+        _continuation_result("SUMMARY_REQUEST_READY", 0)
+    )
+    wrapper["output"] = "\n".join(
+        (wrapper["output"], continuation["output"])
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        _response(
+            content="model rewrote terminal report",
+            tool_calls=None,
+            finish_reason="stop",
+        ),
+    ]
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                json.dumps(wrapper),
+                "call-1",
+            )
+        )
+
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["failed"] is False
+    assert result["turn_exit_reason"] == "exact_delivery_success"
+    assert result["final_response"] == "must remain exact"
+    assert result["final_delivery"]["message"] == "must remain exact"
+
+
 def test_candidate_contract_failure_refuses_without_model_fallback(
     monkeypatch,
     tmp_path,

@@ -270,35 +270,40 @@ def parse_declared_intermediate_state(
         tool_results,
         allowed_exit_codes=INGEST_CONTINUATION_EXIT_CODES,
     )
-    candidates = [stdout]
-    candidates.extend(
-        line for line in reversed(stdout.splitlines()) if line.strip()
-    )
-    envelope: dict[str, Any] | None = None
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(parsed, dict):
-            envelope = parsed
-            break
-    if envelope is None:
+    try:
+        whole = json.loads(stdout)
+    except (TypeError, ValueError):
+        whole = None
+    envelopes: list[dict[str, Any]] = []
+    if isinstance(whole, dict):
+        envelopes.append(whole)
+    else:
+        candidates = (line for line in stdout.splitlines() if line.strip())
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                envelopes.append(parsed)
+    if not envelopes:
         raise FinalDeliveryError("terminal_result: ingest state envelope is missing")
 
-    pair = (envelope.get("state"), exit_code)
-    if pair not in INGEST_CONTINUATION_STATE_EXIT_CODES:
-        raise FinalDeliveryError("contract: declared continuation pair is missing")
     terminal_report_fields = {
         "final_report_message",
         "final_report_message_sha256",
         "final_report_contract",
         "final_report_delivery_contract",
     }
-    if terminal_report_fields.intersection(envelope):
+    if any(terminal_report_fields.intersection(item) for item in envelopes):
         raise FinalDeliveryError(
-            "contract: continuation state carries terminal report fields"
+            "contract: continuation output carries terminal report fields"
         )
+
+    envelope = envelopes[-1]
+    pair = (envelope.get("state"), exit_code)
+    if pair not in INGEST_CONTINUATION_STATE_EXIT_CODES:
+        raise FinalDeliveryError("contract: declared continuation pair is missing")
     return pair[0]
 
 
