@@ -4826,7 +4826,10 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
+        _first_value_delivered = False
+
         def _first_value_delivery_cb(message: str, digest: str) -> bool:
+            nonlocal _first_value_delivered
             if (
                 not ctx._run_still_current()
                 or not ctx._status_adapter
@@ -4848,7 +4851,10 @@ class TurnRunner:
             if future is None:
                 return False
             try:
-                return future.result(timeout=15) is True
+                delivered = future.result(timeout=15) is True
+                if delivered:
+                    _first_value_delivered = True
+                return delivered
             except Exception as exc:
                 logger.warning("first-value checkpoint delivery failed: %s", exc)
                 return False
@@ -5751,6 +5757,17 @@ class TurnRunner:
         
         # Return final response, or a message if something went wrong
         final_response = result.get("final_response")
+        _first_value_followup_suppressed = bool(
+            _first_value_delivered
+            and not result.get("failed", False)
+            and "final_delivery" not in result
+        )
+        if _first_value_followup_suppressed:
+            logger.info(
+                "Suppressing ordinary post-first-value final send for session %s: "
+                "the exact first-value checkpoint is the authoritative visible output.",
+                ctx.session_key or "?",
+            )
 
         # Extract actual token counts from the agent instance used for this run
         _last_prompt_toks = 0
@@ -5874,6 +5891,9 @@ class TurnRunner:
                 final_response = f"⚠️ {result['error']}" if result.get("error") else ""
             return {
                 "final_response": final_response,
+                "first_value_delivered": _first_value_delivered,
+                "first_value_followup_suppressed": _first_value_followup_suppressed,
+                **({"already_sent": True} if _first_value_followup_suppressed else {}),
                 "messages": result.get("messages", []),
                 "api_calls": result.get("api_calls", 0),
                 "failed": result.get("failed", False),
@@ -5950,6 +5970,9 @@ class TurnRunner:
 
         return {
             "final_response": final_response,
+            "first_value_delivered": _first_value_delivered,
+            "first_value_followup_suppressed": _first_value_followup_suppressed,
+            **({"already_sent": True} if _first_value_followup_suppressed else {}),
             "last_reasoning": result.get("last_reasoning"),
             "messages": ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else [],
             "api_calls": ctx.result_holder[0].get("api_calls", 0) if ctx.result_holder[0] else 0,
