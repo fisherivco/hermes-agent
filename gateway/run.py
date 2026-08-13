@@ -707,6 +707,56 @@ _TYPED_FINAL_DELIVERY_REFUSAL = (
 )
 
 
+async def _deliver_first_value_checkpoint_exact(
+    *,
+    adapter: Any,
+    chat_id: str,
+    message: str,
+    digest: str,
+    metadata: Optional[dict],
+) -> bool:
+    """Deliver one runner-owned first-value checkpoint through Discord's ACK rail."""
+    try:
+        from gateway.config import Platform
+
+        config = _load_gateway_config()
+        gateway_config = config.get("gateway", {}) if isinstance(config, dict) else {}
+        if (
+            not isinstance(gateway_config, dict)
+            or gateway_config.get("verbatim_delivery_enabled") is not True
+            or getattr(adapter, "platform", None) != Platform.DISCORD
+            or not isinstance(message, str)
+            or not message.strip()
+            or message.endswith(("\n", "\r"))
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            return False
+        exact_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        exact_metadata.update(
+            {
+                "exact_delivery": True,
+                "exact_delivery_sha256": digest,
+            }
+        )
+        result = await adapter.send(
+            chat_id,
+            message,
+            metadata=exact_metadata,
+        )
+        raw = getattr(result, "raw_response", None)
+        return bool(
+            getattr(result, "success", False)
+            and isinstance(raw, dict)
+            and raw.get("returned_content") == message
+            and raw.get("returned_content_sha256") == digest
+        )
+    except Exception:
+        logger.exception("first-value exact checkpoint delivery failed")
+        return False
+
+
 def _typed_final_delivery_or_fallback(
     agent_result: dict,
     current_response: str,
@@ -4776,6 +4826,33 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
+        def _first_value_delivery_cb(message: str, digest: str) -> bool:
+            if (
+                not ctx._run_still_current()
+                or not ctx._status_adapter
+                or ctx.source.platform != Platform.DISCORD
+            ):
+                return False
+            future = safe_schedule_threadsafe(
+                _deliver_first_value_checkpoint_exact(
+                    adapter=ctx._status_adapter,
+                    chat_id=ctx._status_chat_id,
+                    message=message,
+                    digest=digest,
+                    metadata=ctx._status_thread_metadata,
+                ),
+                ctx._loop_for_step,
+                logger=logger,
+                log_message="first-value checkpoint scheduling error",
+            )
+            if future is None:
+                return False
+            try:
+                return future.result(timeout=15) is True
+            except Exception as exc:
+                logger.warning("first-value checkpoint delivery failed: %s", exc)
+                return False
+
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
         # Per-platform skip_context_files — messaging platforms can opt out
@@ -5081,6 +5158,7 @@ class TurnRunner:
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+        agent.first_value_delivery_callback = _first_value_delivery_cb
         agent.status_callback = ctx._status_callback_sync
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a

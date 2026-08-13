@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import hashlib
 from types import SimpleNamespace
@@ -84,6 +85,110 @@ def _runner(monkeypatch: pytest.MonkeyPatch, tmp_path) -> gateway_run.GatewayRun
         lambda *_args, **_kwargs: 100_000,
     )
     return runner
+
+
+def test_first_value_checkpoint_uses_exact_ack_rail(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"gateway": {"verbatim_delivery_enabled": True}},
+    )
+    message = "Source Note Draft ready\nSummary: grounded first value"
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    adapter = SimpleNamespace(
+        platform=Platform.DISCORD,
+        send=AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                raw_response={
+                    "returned_content": message,
+                    "returned_content_sha256": digest,
+                },
+            )
+        ),
+    )
+
+    delivered = asyncio.run(
+        gateway_run._deliver_first_value_checkpoint_exact(
+            adapter=adapter,
+            chat_id="42",
+            message=message,
+            digest=digest,
+            metadata={"thread_id": "thread-1"},
+        )
+    )
+
+    assert delivered is True
+    adapter.send.assert_awaited_once_with(
+        "42",
+        message,
+        metadata={
+            "thread_id": "thread-1",
+            "exact_delivery": True,
+            "exact_delivery_sha256": digest,
+        },
+    )
+
+
+def test_first_value_checkpoint_rejects_mismatched_ack(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"gateway": {"verbatim_delivery_enabled": True}},
+    )
+    message = "Source Note Draft ready"
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    adapter = SimpleNamespace(
+        platform=Platform.DISCORD,
+        send=AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                raw_response={
+                    "returned_content": message + " altered",
+                    "returned_content_sha256": digest,
+                },
+            )
+        ),
+    )
+
+    delivered = asyncio.run(
+        gateway_run._deliver_first_value_checkpoint_exact(
+            adapter=adapter,
+            chat_id="42",
+            message=message,
+            digest=digest,
+            metadata=None,
+        )
+    )
+
+    assert delivered is False
+
+
+def test_first_value_checkpoint_gate_off_does_not_send(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"gateway": {"verbatim_delivery_enabled": False}},
+    )
+    message = "Source Note Draft ready"
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    adapter = SimpleNamespace(
+        platform=Platform.DISCORD,
+        send=AsyncMock(),
+    )
+
+    delivered = asyncio.run(
+        gateway_run._deliver_first_value_checkpoint_exact(
+            adapter=adapter,
+            chat_id="42",
+            message=message,
+            digest=digest,
+            metadata=None,
+        )
+    )
+
+    assert delivered is False
+    adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

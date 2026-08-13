@@ -13,6 +13,7 @@ from agent.final_delivery import (
     FinalDeliveryError,
     is_terminal_final_delivery_candidate,
     parse_declared_intermediate_state,
+    parse_first_value_delivery,
     parse_terminal_final_delivery,
 )
 
@@ -121,6 +122,39 @@ def test_yts_start_analysis_ready_is_a_declared_continuation(monkeypatch) -> Non
     assert (
         parse_declared_intermediate_state([call], [result]) == "ANALYSIS_REQUEST_READY"
     )
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "state", "exit_code"),
+    [
+        ("start", "ANALYSIS_REQUEST_READY", 0),
+        ("start", "NO_TRANSCRIPT", 4),
+        ("finalize", "VERIFIED", 0),
+    ],
+)
+def test_yts_states_bypass_ingest_first_value_parser(
+    monkeypatch,
+    subcommand: str,
+    state: str,
+    exit_code: int,
+) -> None:
+    command = (
+        f'python3 "{YTS_WORKFLOW}" {subcommand} '
+        '--url "https://youtu.be/abc123ABC12"'
+    )
+    envelope = (
+        {"state": state, "next_action": "write_submission"}
+        if state == "ANALYSIS_REQUEST_READY"
+        else _envelope(state, "bounded response")
+    )
+    call, result = _pair(
+        command=command,
+        envelope=envelope,
+        exit_code=exit_code,
+    )
+    _no_redaction(monkeypatch)
+
+    assert parse_first_value_delivery([call], [result]) is None
 
 
 def test_yts_no_transcript_exit_four_is_exact_without_model_reauthoring(

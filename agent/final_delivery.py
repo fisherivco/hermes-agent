@@ -142,6 +142,19 @@ VERIFIED_DELIVERY_CONTRACT_V3 = {
 
 VERIFIED_DELIVERY_CONTRACT = VERIFIED_DELIVERY_CONTRACT_V2
 
+FIRST_VALUE_DELIVERY_CONTRACT = {
+    "version": "ingest.first-value-report.v2.direct",
+    "authoritative_field": "first_value_report_message",
+    "integrity_field": "first_value_report_message_sha256",
+    "integrity_status": "RUNNER_VERIFIED",
+    "agent_digest_verification_required": False,
+    "visible_reply": "DIRECT_FIELD_ONLY",
+    "preamble_allowed": False,
+    "suffix_allowed": False,
+    "explanation_allowed": False,
+    "post_delivery_visible_text_allowed": False,
+}
+
 YTS_FINAL_REPORT_CONTRACT = {
     "version": "yts.origin-report.v1.verbatim",
     "authoritative_field": "final_report_message",
@@ -401,6 +414,40 @@ def _extract_envelope(stdout: str) -> dict[str, Any]:
     return envelopes[0]
 
 
+def _extract_first_value_envelope(stdout: str) -> dict[str, Any] | None:
+    if not isinstance(stdout, str) or not stdout:
+        raise FinalDeliveryError("terminal_result: stdout is empty")
+    candidates: list[dict[str, Any]] = []
+    try:
+        whole = json.loads(stdout)
+    except (TypeError, ValueError):
+        whole = None
+    values = [whole] if isinstance(whole, dict) else []
+    if not values:
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                values.append(parsed)
+    for value in values:
+        if (
+            value.get("state") == "FIRST_VALUE_READY"
+            or "first_value_report_delivery_contract" in value
+        ):
+            candidates.append(value)
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise FinalDeliveryError(
+            "terminal_result: first-value envelope is ambiguous"
+        )
+    return candidates[0]
+
+
 def _validated_terminal_stdout(
     tool_calls: Iterable[Any],
     tool_results: Iterable[dict[str, Any]],
@@ -522,6 +569,63 @@ def parse_declared_intermediate_state(
     if pair not in allowed_pairs:
         raise FinalDeliveryError("contract: declared continuation pair is missing")
     return pair[0]
+
+
+def parse_first_value_delivery(
+    tool_calls: Iterable[Any],
+    tool_results: Iterable[dict[str, Any]],
+) -> FinalDelivery | None:
+    """Return exact first-value bytes, or None when this is another ingest state."""
+    stdout, exit_code, profile = _validated_terminal_stdout(
+        tool_calls,
+        tool_results,
+        allowed_profiles=frozenset({
+            INGEST_PROFILE,
+            YTS_START_PROFILE,
+            YTS_FINALIZE_PROFILE,
+        }),
+        allowed_exit_codes={
+            INGEST_PROFILE: INGEST_CONTINUATION_EXIT_CODES | frozenset({0}),
+            YTS_START_PROFILE: frozenset({0, 4, 5}),
+            YTS_FINALIZE_PROFILE: frozenset({0}),
+        },
+    )
+    if profile != INGEST_PROFILE:
+        return None
+    envelope = _extract_first_value_envelope(stdout)
+    if envelope is None:
+        return None
+    if exit_code != 0:
+        raise FinalDeliveryError("first-value: terminal profile is invalid")
+    if envelope.get("state") != "FIRST_VALUE_READY":
+        raise FinalDeliveryError("first-value: terminal state is invalid")
+    if envelope.get("readiness") not in {"READY_FULL", "READY_PARTIAL"}:
+        raise FinalDeliveryError("first-value: readiness is invalid")
+    if envelope.get("first_value_report_integrity") != "RUNNER_VERIFIED":
+        raise FinalDeliveryError("first-value: integrity status is invalid")
+    if envelope.get("first_value_report_delivery_contract") != FIRST_VALUE_DELIVERY_CONTRACT:
+        raise FinalDeliveryError("first-value: delivery contract is invalid")
+    message = envelope.get("first_value_report_message")
+    digest = envelope.get("first_value_report_message_sha256")
+    if (
+        not isinstance(message, str)
+        or not message.strip()
+        or message.endswith(("\n", "\r"))
+    ):
+        raise FinalDeliveryError("first-value: report message is invalid")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise FinalDeliveryError("first-value: report SHA is malformed")
+    try:
+        computed = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError as exc:
+        raise FinalDeliveryError("first-value: report is not valid UTF-8") from exc
+    if digest != computed:
+        raise FinalDeliveryError("first-value: report SHA mismatch")
+    return FinalDelivery(message=message, sha256=digest)
 
 
 def parse_terminal_final_delivery(

@@ -118,6 +118,106 @@ def _continuation_result(state: str, exit_code: int) -> str:
     )
 
 
+def _first_value_result(message: str) -> str:
+    envelope = {
+        "state": "FIRST_VALUE_READY",
+        "readiness": "READY_FULL",
+        "first_value_report_message": message,
+        "first_value_report_message_sha256": hashlib.sha256(
+            message.encode("utf-8")
+        ).hexdigest(),
+        "first_value_report_integrity": "RUNNER_VERIFIED",
+        "first_value_report_delivery_contract": {
+            "version": "ingest.first-value-report.v2.direct",
+            "authoritative_field": "first_value_report_message",
+            "integrity_field": "first_value_report_message_sha256",
+            "integrity_status": "RUNNER_VERIFIED",
+            "agent_digest_verification_required": False,
+            "visible_reply": "DIRECT_FIELD_ONLY",
+            "preamble_allowed": False,
+            "suffix_allowed": False,
+            "explanation_allowed": False,
+            "post_delivery_visible_text_allowed": False,
+        },
+    }
+    return json.dumps(
+        {
+            "output": "\n".join(
+                (
+                    json.dumps({"state": "SUMMARY_READY"}),
+                    json.dumps(envelope),
+                )
+            ),
+            "exit_code": 0,
+            "error": None,
+        }
+    )
+
+
+def test_first_value_checkpoint_is_exactly_delivered_then_loop_continues(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    call = _call()
+    second_call = _call()
+    first_value_message = "Source Note Draft ready\nSummary: grounded first value"
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[call]),
+        _response(tool_calls=[second_call]),
+    ]
+    tool_results = iter(
+        (
+            _first_value_result(first_value_message),
+            _terminal_result("verified final payload"),
+        )
+    )
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                next(tool_results),
+                "call-1",
+            )
+        )
+
+    delivered = []
+    ordering = []
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=lambda *_args, **_kwargs: ordering.append("persisted") or True
+    )
+    agent.first_value_delivery_callback = (
+        lambda message, digest: (
+            ordering.append("delivered"),
+            delivered.append((message, digest)),
+            True,
+        )[-1]
+    )
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 2
+    assert ordering.index("persisted") < ordering.index("delivered")
+    assert delivered == [
+        (
+            first_value_message,
+            hashlib.sha256(first_value_message.encode("utf-8")).hexdigest(),
+        )
+    ]
+    assert result["final_response"] == "verified final payload"
+    assert result["turn_exit_reason"] == "exact_delivery_success"
+
+
 def test_qualifying_terminal_result_exits_before_model_reauthors_bytes(
     monkeypatch,
     tmp_path,

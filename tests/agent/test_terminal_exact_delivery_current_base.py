@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent import final_delivery as final_delivery_module
 from agent.final_delivery import (
     FinalDeliveryError,
     is_terminal_final_delivery_candidate,
@@ -133,6 +134,35 @@ def _v3_envelope(*, partial: bool = False) -> dict:
     return envelope
 
 
+def _first_value_envelope() -> dict:
+    message = (
+        "Source Note Draft ready (READY_FULL)\n"
+        "Source: memory/inbox/example.md\n"
+        "Summary: grounded first value"
+    )
+    return {
+        "state": "FIRST_VALUE_READY",
+        "readiness": "READY_FULL",
+        "first_value_report_message": message,
+        "first_value_report_message_sha256": hashlib.sha256(
+            message.encode("utf-8")
+        ).hexdigest(),
+        "first_value_report_integrity": "RUNNER_VERIFIED",
+        "first_value_report_delivery_contract": {
+            "version": "ingest.first-value-report.v2.direct",
+            "authoritative_field": "first_value_report_message",
+            "integrity_field": "first_value_report_message_sha256",
+            "integrity_status": "RUNNER_VERIFIED",
+            "agent_digest_verification_required": False,
+            "visible_reply": "DIRECT_FIELD_ONLY",
+            "preamble_allowed": False,
+            "suffix_allowed": False,
+            "explanation_allowed": False,
+            "post_delivery_visible_text_allowed": False,
+        },
+    }
+
+
 def _pair(
     *,
     envelope: dict | None = None,
@@ -178,6 +208,33 @@ def test_accepts_observed_multistage_current_turn_shape(monkeypatch) -> None:
 
     assert delivery.message == "## Exact report"
     assert delivery.sha256 == hashlib.sha256(delivery.message.encode()).hexdigest()
+
+
+def test_accepts_first_value_checkpoint_before_continuation(monkeypatch) -> None:
+    envelope = _first_value_envelope()
+    call, result = _pair(envelope=envelope)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    delivery = final_delivery_module.parse_first_value_delivery([call], [result])
+
+    assert delivery is not None
+    assert delivery.message == envelope["first_value_report_message"]
+
+
+def test_rejects_first_value_checkpoint_with_mismatched_sha(monkeypatch) -> None:
+    envelope = _first_value_envelope()
+    envelope["first_value_report_message_sha256"] = "0" * 64
+    call, result = _pair(envelope=envelope)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="first-value"):
+        final_delivery_module.parse_first_value_delivery([call], [result])
 
 
 @pytest.mark.parametrize("partial", [False, True])
