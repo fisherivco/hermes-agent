@@ -70,7 +70,7 @@ YTS_TERMINAL_STATE_EXIT_CODES = {
     }),
 }
 
-VERIFIED_FINAL_REPORT_CONTRACT = {
+VERIFIED_FINAL_REPORT_CONTRACT_V2 = {
     "version": "a054.final-report.v2.verbatim",
     "authoritative_field": "final_report_message",
     "sha256_field": "final_report_message_sha256",
@@ -100,7 +100,28 @@ VERIFIED_FINAL_REPORT_CONTRACT = {
     "success": True,
 }
 
-VERIFIED_DELIVERY_CONTRACT = {
+VERIFIED_FINAL_REPORT_CONTRACT_V3 = {
+    **VERIFIED_FINAL_REPORT_CONTRACT_V2,
+    "version": "a054.final-report.v3.verbatim",
+    "integrity_status": "RUNNER_VERIFIED",
+    "agent_digest_verification_required": False,
+    "visible_reply": "DIRECT_FIELD_ONLY",
+    "preamble_allowed": False,
+    "suffix_allowed": False,
+    "explanation_allowed": False,
+    "completion_fields": [
+        "completion_status",
+        "publication_status",
+        "material_readiness",
+        "outstanding_components",
+    ],
+}
+
+# Preserve the public v2 fixture API while the ingest producer and consumer
+# migrate through an explicitly versioned compatibility window.
+VERIFIED_FINAL_REPORT_CONTRACT = VERIFIED_FINAL_REPORT_CONTRACT_V2
+
+VERIFIED_DELIVERY_CONTRACT_V2 = {
     "version": "a054.final-report-delivery.v2",
     "authoritative_field": "final_report_message",
     "sha256_field": "final_report_message_sha256",
@@ -113,6 +134,78 @@ VERIFIED_DELIVERY_CONTRACT = {
     "reconstruction_allowed": False,
     "terminal_newline": "forbidden",
 }
+
+VERIFIED_DELIVERY_CONTRACT_V3 = {
+    **VERIFIED_DELIVERY_CONTRACT_V2,
+    "version": "a054.final-report-delivery.v3",
+}
+
+VERIFIED_DELIVERY_CONTRACT = VERIFIED_DELIVERY_CONTRACT_V2
+
+FIRST_VALUE_DELIVERY_CONTRACT = {
+    "version": "ingest.first-value-report.v2.direct",
+    "authoritative_field": "first_value_report_message",
+    "integrity_field": "first_value_report_message_sha256",
+    "integrity_status": "RUNNER_VERIFIED",
+    "agent_digest_verification_required": False,
+    "visible_reply": "DIRECT_FIELD_ONLY",
+    "preamble_allowed": False,
+    "suffix_allowed": False,
+    "explanation_allowed": False,
+    "post_delivery_visible_text_allowed": False,
+}
+
+MATERIAL_BLOCKED_FINAL_REPORT_CONTRACT = {
+    "version": "a054.material-blocked-report.v1.verbatim",
+    "authoritative_field": "final_report_message",
+    "sha256_field": "final_report_message_sha256",
+    "encoding": "utf-8",
+    "normalization": "none",
+    "delivery": "exact_verbatim",
+    "terminal_newline": "forbidden",
+    "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+    "model_reauthoring_allowed": False,
+    "integrity_status": "RUNNER_VERIFIED",
+    "agent_digest_verification_required": False,
+    "visible_reply": "DIRECT_FIELD_ONLY",
+    "preamble_allowed": False,
+    "suffix_allowed": False,
+    "explanation_allowed": False,
+    "required_fields": [
+        "state",
+        "source_key",
+        "draft_path",
+        "counts",
+        "blocked_components",
+        "reason",
+        "semantic_authoring_allowed",
+        "next_action",
+    ],
+    "counts_source": "durable_material_state",
+    "success": False,
+}
+
+MATERIAL_BLOCKED_DELIVERY_CONTRACT = {
+    "version": "a054.material-blocked-report-delivery.v1",
+    "authoritative_field": "final_report_message",
+    "sha256_field": "final_report_message_sha256",
+    "encoding": "utf-8",
+    "normalization": "none",
+    "mode": "exact_verbatim",
+    "preamble_allowed": False,
+    "suffix_allowed": False,
+    "translation_allowed": False,
+    "reconstruction_allowed": False,
+    "terminal_newline": "forbidden",
+    "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+}
+
+MATERIAL_BLOCK_REASONS = frozenset({
+    "required_material_is_terminal",
+    "required_material_recovery_unavailable",
+    "material_recovery_ceiling_reached",
+    "material_recovery_made_no_progress",
+})
 
 YTS_FINAL_REPORT_CONTRACT = {
     "version": "yts.origin-report.v1.verbatim",
@@ -248,6 +341,183 @@ def _contains_required_contract(actual: Any, required: dict[str, Any]) -> bool:
     )
 
 
+def _verified_ingest_contracts(
+    envelope: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    report = envelope.get("final_report_contract")
+    delivery = envelope.get("final_report_delivery_contract")
+    versions = (
+        report.get("version") if isinstance(report, dict) else None,
+        delivery.get("version") if isinstance(delivery, dict) else None,
+    )
+    if versions == (
+        "a054.final-report.v2.verbatim",
+        "a054.final-report-delivery.v2",
+    ):
+        return VERIFIED_FINAL_REPORT_CONTRACT_V2, VERIFIED_DELIVERY_CONTRACT_V2
+    if versions == (
+        "a054.final-report.v3.verbatim",
+        "a054.final-report-delivery.v3",
+    ):
+        _validate_v3_completion(envelope)
+        return VERIFIED_FINAL_REPORT_CONTRACT_V3, VERIFIED_DELIVERY_CONTRACT_V3
+    raise FinalDeliveryError("contract: final-report contract versions are incompatible")
+
+
+def _validate_v3_completion(envelope: dict[str, Any]) -> None:
+    completion_status = envelope.get("completion_status")
+    publication_status = envelope.get("publication_status")
+    material_readiness = envelope.get("material_readiness")
+    outstanding = envelope.get("outstanding_components")
+    if (
+        not isinstance(completion_status, str)
+        or completion_status not in {"VERIFIED_COMPLETE", "VERIFIED_PARTIAL"}
+        or publication_status != "VERIFIED"
+        or not isinstance(material_readiness, str)
+        or material_readiness not in {"COMPLETE", "PARTIAL"}
+        or not isinstance(outstanding, list)
+    ):
+        raise FinalDeliveryError("contract: v3 completion fields are invalid")
+    partial = bool(outstanding)
+    if completion_status != (
+        "VERIFIED_PARTIAL" if partial else "VERIFIED_COMPLETE"
+    ) or material_readiness != ("PARTIAL" if partial else "COMPLETE"):
+        raise FinalDeliveryError("contract: v3 completion fields disagree")
+
+    component_lines: list[str] = []
+    seen: set[str] = set()
+    expected_actions = {
+        "retryable": "retry_component_capture_without_root_refetch",
+        "blocked": "review_component_capture_failure",
+        "unavailable": "record_component_unavailable",
+    }
+    for item in outstanding:
+        if not isinstance(item, dict) or set(item) != {
+            "component_id",
+            "kind",
+            "source_status",
+            "status",
+            "next_action",
+        }:
+            raise FinalDeliveryError("contract: v3 completion component is invalid")
+        component_id = item.get("component_id")
+        kind = item.get("kind")
+        source_status = item.get("source_status")
+        status = item.get("status")
+        next_action = item.get("next_action")
+        if (
+            not isinstance(component_id, str)
+            or not component_id
+            or component_id in seen
+            or not isinstance(kind, str)
+            or not kind
+            or not isinstance(source_status, str)
+            or source_status not in {"failed", "pending", "missing", "unsupported"}
+            or not isinstance(status, str)
+            or status not in expected_actions
+            or next_action != expected_actions.get(status)
+        ):
+            raise FinalDeliveryError("contract: v3 completion component is invalid")
+        seen.add(component_id)
+        component_lines.append(f"- {component_id} [{kind}]: {status}")
+
+    message = envelope.get("final_report_message")
+    if not isinstance(message, str):
+        raise FinalDeliveryError("contract: v3 completion message is invalid")
+    expected_header = [
+        f"Status: {completion_status}",
+        "Publication: VERIFIED",
+        f"Material readiness: {material_readiness}",
+        f"Outstanding components: {len(outstanding)}",
+        *(component_lines or ["- none"]),
+    ]
+    if message.splitlines()[4 : 4 + len(expected_header)] != expected_header:
+        raise FinalDeliveryError("contract: v3 completion header disagrees")
+
+
+def _validate_material_blocked(envelope: dict[str, Any]) -> None:
+    report = envelope.get("material_report")
+    if not isinstance(report, dict) or set(report) != {
+        "state",
+        "source_key",
+        "draft_path",
+        "counts",
+        "blocked_components",
+        "reason",
+        "semantic_authoring_allowed",
+        "next_action",
+    }:
+        raise FinalDeliveryError("contract: material report is invalid")
+    source_key = report.get("source_key")
+    draft_path = report.get("draft_path")
+    reason = report.get("reason")
+    next_action = report.get("next_action")
+    for value in (source_key, draft_path, reason, next_action):
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\n" in value
+            or "\r" in value
+        ):
+            raise FinalDeliveryError("contract: material report text is invalid")
+    counts = report.get("counts")
+    if not isinstance(counts, dict) or set(counts) != {
+        "required",
+        "complete",
+        "pending_retryable",
+        "terminal",
+    }:
+        raise FinalDeliveryError("contract: material counts are invalid")
+    if any(type(counts[key]) is not int or counts[key] < 0 for key in counts):
+        raise FinalDeliveryError("contract: material counts are invalid")
+    required = counts["required"]
+    complete = counts["complete"]
+    pending = counts["pending_retryable"]
+    terminal = counts["terminal"]
+    blocked = report.get("blocked_components")
+    if (
+        required < 1
+        or complete + pending + terminal != required
+        or not isinstance(blocked, list)
+        or not blocked
+        or len(blocked) != pending + terminal
+        or any(not isinstance(item, str) or not item for item in blocked)
+        or len(set(blocked)) != len(blocked)
+        or reason not in MATERIAL_BLOCK_REASONS
+        or report.get("semantic_authoring_allowed") is not False
+        or next_action != "retain_material_state_and_stop"
+    ):
+        raise FinalDeliveryError("contract: material report partition is invalid")
+    for key in (
+        "state",
+        "source_key",
+        "draft_path",
+        "blocked_components",
+        "reason",
+        "semantic_authoring_allowed",
+        "next_action",
+    ):
+        if envelope.get(key) != report.get(key):
+            raise FinalDeliveryError("contract: material envelope disagrees")
+    expected_message = (
+        "Material settlement retained\n"
+        "Status: MATERIAL_BLOCKED_RETAINED\n"
+        f"Source Key: {source_key}\n"
+        f"Draft: {draft_path}\n"
+        f"Required material: {required}\n"
+        f"Complete required material: {complete}\n"
+        f"Pending retryable material: {pending}\n"
+        f"Terminal material: {terminal}\n"
+        f"Blocked components: {', '.join(blocked)}\n"
+        f"Reason: {reason}\n"
+        "Semantic authoring allowed: false\n"
+        f"Next action: {next_action}"
+    )
+    if envelope.get("final_report_message") != expected_message:
+        raise FinalDeliveryError("contract: material report message disagrees")
+
+
 def _extract_envelope(stdout: str) -> dict[str, Any]:
     if not isinstance(stdout, str) or not stdout:
         raise FinalDeliveryError("terminal_result: stdout is empty")
@@ -277,6 +547,40 @@ def _extract_envelope(stdout: str) -> dict[str, Any]:
             "terminal_result: final-report envelope is ambiguous"
         )
     return envelopes[0]
+
+
+def _extract_first_value_envelope(stdout: str) -> dict[str, Any] | None:
+    if not isinstance(stdout, str) or not stdout:
+        raise FinalDeliveryError("terminal_result: stdout is empty")
+    candidates: list[dict[str, Any]] = []
+    try:
+        whole = json.loads(stdout)
+    except (TypeError, ValueError):
+        whole = None
+    values = [whole] if isinstance(whole, dict) else []
+    if not values:
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                values.append(parsed)
+    for value in values:
+        if (
+            value.get("state") == "FIRST_VALUE_READY"
+            or "first_value_report_delivery_contract" in value
+        ):
+            candidates.append(value)
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise FinalDeliveryError(
+            "terminal_result: first-value envelope is ambiguous"
+        )
+    return candidates[0]
 
 
 def _validated_terminal_stdout(
@@ -402,6 +706,63 @@ def parse_declared_intermediate_state(
     return pair[0]
 
 
+def parse_first_value_delivery(
+    tool_calls: Iterable[Any],
+    tool_results: Iterable[dict[str, Any]],
+) -> FinalDelivery | None:
+    """Return exact first-value bytes, or None when this is another ingest state."""
+    stdout, exit_code, profile = _validated_terminal_stdout(
+        tool_calls,
+        tool_results,
+        allowed_profiles=frozenset({
+            INGEST_PROFILE,
+            YTS_START_PROFILE,
+            YTS_FINALIZE_PROFILE,
+        }),
+        allowed_exit_codes={
+            INGEST_PROFILE: INGEST_CONTINUATION_EXIT_CODES | frozenset({0, 4}),
+            YTS_START_PROFILE: frozenset({0, 4, 5}),
+            YTS_FINALIZE_PROFILE: frozenset({0}),
+        },
+    )
+    if profile != INGEST_PROFILE:
+        return None
+    envelope = _extract_first_value_envelope(stdout)
+    if envelope is None:
+        return None
+    if exit_code != 0:
+        raise FinalDeliveryError("first-value: terminal profile is invalid")
+    if envelope.get("state") != "FIRST_VALUE_READY":
+        raise FinalDeliveryError("first-value: terminal state is invalid")
+    if envelope.get("readiness") not in {"READY_FULL", "READY_PARTIAL"}:
+        raise FinalDeliveryError("first-value: readiness is invalid")
+    if envelope.get("first_value_report_integrity") != "RUNNER_VERIFIED":
+        raise FinalDeliveryError("first-value: integrity status is invalid")
+    if envelope.get("first_value_report_delivery_contract") != FIRST_VALUE_DELIVERY_CONTRACT:
+        raise FinalDeliveryError("first-value: delivery contract is invalid")
+    message = envelope.get("first_value_report_message")
+    digest = envelope.get("first_value_report_message_sha256")
+    if (
+        not isinstance(message, str)
+        or not message.strip()
+        or message.endswith(("\n", "\r"))
+    ):
+        raise FinalDeliveryError("first-value: report message is invalid")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise FinalDeliveryError("first-value: report SHA is malformed")
+    try:
+        computed = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError as exc:
+        raise FinalDeliveryError("first-value: report is not valid UTF-8") from exc
+    if digest != computed:
+        raise FinalDeliveryError("first-value: report SHA mismatch")
+    return FinalDelivery(message=message, sha256=digest)
+
+
 def parse_terminal_final_delivery(
     tool_calls: Iterable[Any],
     tool_results: Iterable[dict[str, Any]],
@@ -416,7 +777,7 @@ def parse_terminal_final_delivery(
             YTS_FINALIZE_PROFILE,
         }),
         allowed_exit_codes={
-            INGEST_PROFILE: frozenset({0}),
+            INGEST_PROFILE: frozenset({0, 4}),
             YTS_START_PROFILE: frozenset({4, 5}),
             YTS_FINALIZE_PROFILE: frozenset({0}),
         },
@@ -424,10 +785,15 @@ def parse_terminal_final_delivery(
 
     envelope = _extract_envelope(stdout)
     if profile == INGEST_PROFILE:
-        if envelope.get("state") != "VERIFIED":
-            raise FinalDeliveryError("contract: terminal state is not VERIFIED")
-        report_contract = VERIFIED_FINAL_REPORT_CONTRACT
-        delivery_contract = VERIFIED_DELIVERY_CONTRACT
+        state_exit = (envelope.get("state"), exit_code)
+        if state_exit == ("VERIFIED", 0):
+            report_contract, delivery_contract = _verified_ingest_contracts(envelope)
+        elif state_exit == ("MATERIAL_BLOCKED_RETAINED", 4):
+            _validate_material_blocked(envelope)
+            report_contract = MATERIAL_BLOCKED_FINAL_REPORT_CONTRACT
+            delivery_contract = MATERIAL_BLOCKED_DELIVERY_CONTRACT
+        else:
+            raise FinalDeliveryError("contract: ingest terminal state/exit pair is invalid")
     else:
         if (
             envelope.get("state"),

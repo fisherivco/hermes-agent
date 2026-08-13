@@ -6806,6 +6806,7 @@ def run_conversation(
                 from agent.final_delivery import (
                     FinalDeliveryError,
                     is_terminal_final_delivery_candidate,
+                    parse_first_value_delivery,
                     parse_declared_intermediate_state,
                     parse_terminal_final_delivery,
                 )
@@ -6828,6 +6829,60 @@ def run_conversation(
                         and message.get("role") == "tool"
                         and message.get("tool_call_id") in current_call_ids
                     ]
+                    try:
+                        first_value_delivery = parse_first_value_delivery(
+                            assistant_message.tool_calls,
+                            current_results,
+                        )
+                    except FinalDeliveryError as exc:
+                        refusal = f"Exact delivery refused: {exc}"
+                        messages.append({"role": "assistant", "content": refusal})
+                        final_response = refusal
+                        _exact_delivery_refusal = refusal
+                        failed = True
+                        _turn_exit_reason = "exact_delivery_refused"
+                        break
+                    if first_value_delivery is not None:
+                        checkpoint = {
+                            "role": "assistant",
+                            "content": first_value_delivery.message,
+                        }
+                        messages.append(checkpoint)
+                        try:
+                            persisted = agent._flush_messages_to_session_db(
+                                messages,
+                                conversation_history,
+                            )
+                        except Exception:
+                            persisted = False
+                        callback = getattr(
+                            agent,
+                            "first_value_delivery_callback",
+                            None,
+                        )
+                        delivered = False
+                        if persisted is not False and callable(callback):
+                            try:
+                                delivered = callback(
+                                    first_value_delivery.message,
+                                    first_value_delivery.sha256,
+                                ) is True
+                            except Exception:
+                                delivered = False
+                        if not delivered:
+                            refusal = (
+                                "Exact delivery refused: first-value checkpoint "
+                                "could not be durably delivered"
+                            )
+                            messages.append(
+                                {"role": "assistant", "content": refusal}
+                            )
+                            final_response = refusal
+                            _exact_delivery_refusal = refusal
+                            failed = True
+                            _turn_exit_reason = "exact_delivery_refused"
+                            break
+                        continue
                     try:
                         intermediate_state = parse_declared_intermediate_state(
                             assistant_message.tool_calls,
