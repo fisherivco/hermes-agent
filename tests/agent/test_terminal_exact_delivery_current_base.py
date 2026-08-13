@@ -70,6 +70,69 @@ def _envelope(message: str = "## Exact report") -> dict:
     }
 
 
+def _v3_envelope(*, partial: bool = False) -> dict:
+    outstanding = (
+        [
+            {
+                "component_id": "video_asr:1",
+                "kind": "video",
+                "source_status": "failed",
+                "status": "retryable",
+                "next_action": "retry_component_capture_without_root_refetch",
+            }
+        ]
+        if partial
+        else []
+    )
+    completion_status = "VERIFIED_PARTIAL" if partial else "VERIFIED_COMPLETE"
+    material_readiness = "PARTIAL" if partial else "COMPLETE"
+    component_lines = (
+        "- video_asr:1 [video]: retryable" if partial else "- none"
+    )
+    message = (
+        "Ingested: Example\n"
+        "Tier: B\n"
+        "Knowledge: memory/knowledge/example.md\n"
+        "Source Final: memory/inbox/raw/example.md\n"
+        f"Status: {completion_status}\n"
+        "Publication: VERIFIED\n"
+        f"Material readiness: {material_readiness}\n"
+        f"Outstanding components: {len(outstanding)}\n"
+        f"{component_lines}\n\n"
+        "## Exact report"
+    )
+    envelope = _envelope(message)
+    envelope.update(
+        {
+            "completion_status": completion_status,
+            "publication_status": "VERIFIED",
+            "material_readiness": material_readiness,
+            "outstanding_components": outstanding,
+        }
+    )
+    envelope["final_report_contract"].update(
+        {
+            "version": "a054.final-report.v3.verbatim",
+            "integrity_status": "RUNNER_VERIFIED",
+            "agent_digest_verification_required": False,
+            "visible_reply": "DIRECT_FIELD_ONLY",
+            "preamble_allowed": False,
+            "suffix_allowed": False,
+            "explanation_allowed": False,
+            "completion_fields": [
+                "completion_status",
+                "publication_status",
+                "material_readiness",
+                "outstanding_components",
+            ],
+        }
+    )
+    envelope["final_report_delivery_contract"]["version"] = (
+        "a054.final-report-delivery.v3"
+    )
+    return envelope
+
+
 def _pair(
     *,
     envelope: dict | None = None,
@@ -115,6 +178,67 @@ def test_accepts_observed_multistage_current_turn_shape(monkeypatch) -> None:
 
     assert delivery.message == "## Exact report"
     assert delivery.sha256 == hashlib.sha256(delivery.message.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_accepts_v3_completion_envelope(monkeypatch, partial: bool) -> None:
+    envelope = _v3_envelope(partial=partial)
+    call, result = _pair(envelope=envelope)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    delivery = parse_terminal_final_delivery([call], [result])
+
+    assert delivery.message == envelope["final_report_message"]
+
+
+def test_rejects_v3_completion_header_that_disagrees_with_payload(
+    monkeypatch,
+) -> None:
+    envelope = _v3_envelope(partial=True)
+    message = envelope["final_report_message"].replace(
+        "Status: VERIFIED_PARTIAL", "Status: VERIFIED_COMPLETE"
+    )
+    envelope["final_report_message"] = message
+    envelope["final_report_message_sha256"] = hashlib.sha256(
+        message.encode("utf-8")
+    ).hexdigest()
+    call, result = _pair(envelope=envelope)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="completion"):
+        parse_terminal_final_delivery([call], [result])
+
+
+def test_rejects_v3_unhashable_completion_status_fail_closed(monkeypatch) -> None:
+    envelope = _v3_envelope(partial=True)
+    envelope["outstanding_components"][0]["status"] = []
+    call, result = _pair(envelope=envelope)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="completion"):
+        parse_terminal_final_delivery([call], [result])
+
+
+def test_rejects_v3_unhashable_completion_summary_fail_closed(monkeypatch) -> None:
+    envelope = _v3_envelope(partial=True)
+    envelope["completion_status"] = []
+    call, result = _pair(envelope=envelope)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="completion"):
+        parse_terminal_final_delivery([call], [result])
 
 
 @pytest.mark.parametrize(

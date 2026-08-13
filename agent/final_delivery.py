@@ -70,7 +70,7 @@ YTS_TERMINAL_STATE_EXIT_CODES = {
     }),
 }
 
-VERIFIED_FINAL_REPORT_CONTRACT = {
+VERIFIED_FINAL_REPORT_CONTRACT_V2 = {
     "version": "a054.final-report.v2.verbatim",
     "authoritative_field": "final_report_message",
     "sha256_field": "final_report_message_sha256",
@@ -100,7 +100,28 @@ VERIFIED_FINAL_REPORT_CONTRACT = {
     "success": True,
 }
 
-VERIFIED_DELIVERY_CONTRACT = {
+VERIFIED_FINAL_REPORT_CONTRACT_V3 = {
+    **VERIFIED_FINAL_REPORT_CONTRACT_V2,
+    "version": "a054.final-report.v3.verbatim",
+    "integrity_status": "RUNNER_VERIFIED",
+    "agent_digest_verification_required": False,
+    "visible_reply": "DIRECT_FIELD_ONLY",
+    "preamble_allowed": False,
+    "suffix_allowed": False,
+    "explanation_allowed": False,
+    "completion_fields": [
+        "completion_status",
+        "publication_status",
+        "material_readiness",
+        "outstanding_components",
+    ],
+}
+
+# Preserve the public v2 fixture API while the ingest producer and consumer
+# migrate through an explicitly versioned compatibility window.
+VERIFIED_FINAL_REPORT_CONTRACT = VERIFIED_FINAL_REPORT_CONTRACT_V2
+
+VERIFIED_DELIVERY_CONTRACT_V2 = {
     "version": "a054.final-report-delivery.v2",
     "authoritative_field": "final_report_message",
     "sha256_field": "final_report_message_sha256",
@@ -113,6 +134,13 @@ VERIFIED_DELIVERY_CONTRACT = {
     "reconstruction_allowed": False,
     "terminal_newline": "forbidden",
 }
+
+VERIFIED_DELIVERY_CONTRACT_V3 = {
+    **VERIFIED_DELIVERY_CONTRACT_V2,
+    "version": "a054.final-report-delivery.v3",
+}
+
+VERIFIED_DELIVERY_CONTRACT = VERIFIED_DELIVERY_CONTRACT_V2
 
 YTS_FINAL_REPORT_CONTRACT = {
     "version": "yts.origin-report.v1.verbatim",
@@ -246,6 +274,100 @@ def _contains_required_contract(actual: Any, required: dict[str, Any]) -> bool:
         and actual[key] == value
         for key, value in required.items()
     )
+
+
+def _verified_ingest_contracts(
+    envelope: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    report = envelope.get("final_report_contract")
+    delivery = envelope.get("final_report_delivery_contract")
+    versions = (
+        report.get("version") if isinstance(report, dict) else None,
+        delivery.get("version") if isinstance(delivery, dict) else None,
+    )
+    if versions == (
+        "a054.final-report.v2.verbatim",
+        "a054.final-report-delivery.v2",
+    ):
+        return VERIFIED_FINAL_REPORT_CONTRACT_V2, VERIFIED_DELIVERY_CONTRACT_V2
+    if versions == (
+        "a054.final-report.v3.verbatim",
+        "a054.final-report-delivery.v3",
+    ):
+        _validate_v3_completion(envelope)
+        return VERIFIED_FINAL_REPORT_CONTRACT_V3, VERIFIED_DELIVERY_CONTRACT_V3
+    raise FinalDeliveryError("contract: final-report contract versions are incompatible")
+
+
+def _validate_v3_completion(envelope: dict[str, Any]) -> None:
+    completion_status = envelope.get("completion_status")
+    publication_status = envelope.get("publication_status")
+    material_readiness = envelope.get("material_readiness")
+    outstanding = envelope.get("outstanding_components")
+    if (
+        not isinstance(completion_status, str)
+        or completion_status not in {"VERIFIED_COMPLETE", "VERIFIED_PARTIAL"}
+        or publication_status != "VERIFIED"
+        or not isinstance(material_readiness, str)
+        or material_readiness not in {"COMPLETE", "PARTIAL"}
+        or not isinstance(outstanding, list)
+    ):
+        raise FinalDeliveryError("contract: v3 completion fields are invalid")
+    partial = bool(outstanding)
+    if completion_status != (
+        "VERIFIED_PARTIAL" if partial else "VERIFIED_COMPLETE"
+    ) or material_readiness != ("PARTIAL" if partial else "COMPLETE"):
+        raise FinalDeliveryError("contract: v3 completion fields disagree")
+
+    component_lines: list[str] = []
+    seen: set[str] = set()
+    expected_actions = {
+        "retryable": "retry_component_capture_without_root_refetch",
+        "blocked": "review_component_capture_failure",
+        "unavailable": "record_component_unavailable",
+    }
+    for item in outstanding:
+        if not isinstance(item, dict) or set(item) != {
+            "component_id",
+            "kind",
+            "source_status",
+            "status",
+            "next_action",
+        }:
+            raise FinalDeliveryError("contract: v3 completion component is invalid")
+        component_id = item.get("component_id")
+        kind = item.get("kind")
+        source_status = item.get("source_status")
+        status = item.get("status")
+        next_action = item.get("next_action")
+        if (
+            not isinstance(component_id, str)
+            or not component_id
+            or component_id in seen
+            or not isinstance(kind, str)
+            or not kind
+            or not isinstance(source_status, str)
+            or source_status not in {"failed", "pending", "missing", "unsupported"}
+            or not isinstance(status, str)
+            or status not in expected_actions
+            or next_action != expected_actions.get(status)
+        ):
+            raise FinalDeliveryError("contract: v3 completion component is invalid")
+        seen.add(component_id)
+        component_lines.append(f"- {component_id} [{kind}]: {status}")
+
+    message = envelope.get("final_report_message")
+    if not isinstance(message, str):
+        raise FinalDeliveryError("contract: v3 completion message is invalid")
+    expected_header = [
+        f"Status: {completion_status}",
+        "Publication: VERIFIED",
+        f"Material readiness: {material_readiness}",
+        f"Outstanding components: {len(outstanding)}",
+        *(component_lines or ["- none"]),
+    ]
+    if message.splitlines()[4 : 4 + len(expected_header)] != expected_header:
+        raise FinalDeliveryError("contract: v3 completion header disagrees")
 
 
 def _extract_envelope(stdout: str) -> dict[str, Any]:
@@ -426,8 +548,7 @@ def parse_terminal_final_delivery(
     if profile == INGEST_PROFILE:
         if envelope.get("state") != "VERIFIED":
             raise FinalDeliveryError("contract: terminal state is not VERIFIED")
-        report_contract = VERIFIED_FINAL_REPORT_CONTRACT
-        delivery_contract = VERIFIED_DELIVERY_CONTRACT
+        report_contract, delivery_contract = _verified_ingest_contracts(envelope)
     else:
         if (
             envelope.get("state"),
