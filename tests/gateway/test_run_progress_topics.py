@@ -1,6 +1,7 @@
 """Tests for topic-aware gateway progress updates."""
 
 import asyncio
+import hashlib
 import importlib
 import sys
 import time
@@ -57,6 +58,26 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+class ExactAckProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Acknowledge Discord exact-delivery sends byte-for-byte."""
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if metadata and metadata.get("exact_delivery"):
+            result.raw_response = {
+                "returned_content": content,
+                "returned_content_sha256": hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest(),
+            }
+        return result
 
 
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -736,6 +757,75 @@ class CommentaryAgent:
         }
 
 
+class FirstValueThenNarrationAgent:
+    """Reproduce a model-authored final after exact first-value delivery."""
+
+    first_value_message = "FIRST_VALUE_READY\nSummary: grounded first value"
+
+    def __init__(self, **kwargs):
+        self.first_value_delivery_callback = kwargs.get(
+            "first_value_delivery_callback"
+        )
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        digest = hashlib.sha256(
+            self.first_value_message.encode("utf-8")
+        ).hexdigest()
+        assert self.first_value_delivery_callback(
+            self.first_value_message,
+            digest,
+        ) is True
+        return {
+            "final_response": "I'll continue the identical request silently.",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class FirstValueThenFailureAgent(FirstValueThenNarrationAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        digest = hashlib.sha256(
+            self.first_value_message.encode("utf-8")
+        ).hexdigest()
+        assert self.first_value_delivery_callback(
+            self.first_value_message,
+            digest,
+        ) is True
+        return {
+            "final_response": "provider failed after first value",
+            "messages": [],
+            "api_calls": 1,
+            "failed": True,
+            "error": "provider failed after first value",
+        }
+
+
+class FirstValueThenTypedTerminalAgent(FirstValueThenNarrationAgent):
+    terminal_message = "VERIFIED_COMPLETE\nSummary: terminal receipt"
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        digest = hashlib.sha256(
+            self.first_value_message.encode("utf-8")
+        ).hexdigest()
+        assert self.first_value_delivery_callback(
+            self.first_value_message,
+            digest,
+        ) is True
+        terminal_digest = hashlib.sha256(
+            self.terminal_message.encode("utf-8")
+        ).hexdigest()
+        return {
+            "final_response": self.terminal_message,
+            "final_delivery": {
+                "message": self.terminal_message,
+                "sha256": terminal_digest,
+            },
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1024,6 +1114,88 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_exact_first_value_suppresses_later_model_narration(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FirstValueThenNarrationAgent,
+        session_id="sess-first-value-then-narration",
+        config_data={
+            "gateway": {"verbatim_delivery_enabled": True},
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+        },
+        platform=Platform.DISCORD,
+        chat_id="dev-inbox",
+        chat_type="channel",
+        thread_id=None,
+        adapter_cls=ExactAckProgressCaptureAdapter,
+    )
+
+    assert [call["content"] for call in adapter.sent] == [
+        FirstValueThenNarrationAgent.first_value_message
+    ]
+    assert result.get("already_sent") is True
+    assert result.get("first_value_delivered") is True
+    assert result.get("first_value_followup_suppressed") is True
+
+
+@pytest.mark.asyncio
+async def test_exact_first_value_does_not_suppress_later_failure(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FirstValueThenFailureAgent,
+        session_id="sess-first-value-then-failure",
+        config_data={"gateway": {"verbatim_delivery_enabled": True}},
+        platform=Platform.DISCORD,
+        chat_id="dev-inbox",
+        chat_type="channel",
+        thread_id=None,
+        adapter_cls=ExactAckProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is not True
+    assert result.get("failed") is True
+    assert result["final_response"] == "provider failed after first value"
+    assert result.get("first_value_followup_suppressed") is False
+
+
+@pytest.mark.asyncio
+async def test_exact_first_value_does_not_suppress_typed_terminal(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FirstValueThenTypedTerminalAgent,
+        session_id="sess-first-value-then-terminal",
+        config_data={"gateway": {"verbatim_delivery_enabled": True}},
+        platform=Platform.DISCORD,
+        chat_id="dev-inbox",
+        chat_type="channel",
+        thread_id=None,
+        adapter_cls=ExactAckProgressCaptureAdapter,
+    )
+
+    assert [call["content"] for call in adapter.sent] == [
+        FirstValueThenTypedTerminalAgent.first_value_message
+    ]
+    assert result.get("already_sent") is not True
+    assert result["final_response"] == FirstValueThenTypedTerminalAgent.terminal_message
+    assert result.get("first_value_followup_suppressed") is False
 
 
 class TransformedStreamAgent:
