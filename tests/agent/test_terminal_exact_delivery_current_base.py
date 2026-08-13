@@ -163,11 +163,95 @@ def _first_value_envelope() -> dict:
     }
 
 
+def _material_blocked_envelope() -> dict:
+    message = (
+        "Material settlement retained\n"
+        "Status: MATERIAL_BLOCKED_RETAINED\n"
+        "Source Key: src_test\n"
+        "Draft: memory/inbox/example.md\n"
+        "Required material: 2\n"
+        "Complete required material: 1\n"
+        "Pending retryable material: 0\n"
+        "Terminal material: 1\n"
+        "Blocked components: video_asr:1\n"
+        "Reason: required_material_is_terminal\n"
+        "Semantic authoring allowed: false\n"
+        "Next action: retain_material_state_and_stop"
+    )
+    material_report = {
+        "state": "MATERIAL_BLOCKED_RETAINED",
+        "source_key": "src_test",
+        "draft_path": "memory/inbox/example.md",
+        "counts": {
+            "required": 2,
+            "complete": 1,
+            "pending_retryable": 0,
+            "terminal": 1,
+        },
+        "blocked_components": ["video_asr:1"],
+        "reason": "required_material_is_terminal",
+        "semantic_authoring_allowed": False,
+        "next_action": "retain_material_state_and_stop",
+    }
+    return {
+        **material_report,
+        "material_report": material_report,
+        "final_report_contract": {
+            "version": "a054.material-blocked-report.v1.verbatim",
+            "authoritative_field": "final_report_message",
+            "sha256_field": "final_report_message_sha256",
+            "encoding": "utf-8",
+            "normalization": "none",
+            "delivery": "exact_verbatim",
+            "terminal_newline": "forbidden",
+            "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+            "model_reauthoring_allowed": False,
+            "integrity_status": "RUNNER_VERIFIED",
+            "agent_digest_verification_required": False,
+            "visible_reply": "DIRECT_FIELD_ONLY",
+            "preamble_allowed": False,
+            "suffix_allowed": False,
+            "explanation_allowed": False,
+            "required_fields": [
+                "state",
+                "source_key",
+                "draft_path",
+                "counts",
+                "blocked_components",
+                "reason",
+                "semantic_authoring_allowed",
+                "next_action",
+            ],
+            "counts_source": "durable_material_state",
+            "success": False,
+        },
+        "final_report_delivery_contract": {
+            "version": "a054.material-blocked-report-delivery.v1",
+            "authoritative_field": "final_report_message",
+            "sha256_field": "final_report_message_sha256",
+            "encoding": "utf-8",
+            "normalization": "none",
+            "mode": "exact_verbatim",
+            "preamble_allowed": False,
+            "suffix_allowed": False,
+            "translation_allowed": False,
+            "reconstruction_allowed": False,
+            "terminal_newline": "forbidden",
+            "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+        },
+        "final_report_message": message,
+        "final_report_message_sha256": hashlib.sha256(
+            message.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def _pair(
     *,
     envelope: dict | None = None,
     command: str | None = None,
     background: bool = False,
+    exit_code: int = 0,
 ) -> tuple[SimpleNamespace, dict]:
     call = SimpleNamespace(
         id="call-1",
@@ -191,7 +275,7 @@ def _pair(
         "name": "terminal",
         "tool_call_id": "call-1",
         "content": json.dumps(
-            {"output": output, "exit_code": 0, "error": None}
+            {"output": output, "exit_code": exit_code, "error": None}
         ),
     }
     return call, result
@@ -235,6 +319,55 @@ def test_rejects_first_value_checkpoint_with_mismatched_sha(monkeypatch) -> None
 
     with pytest.raises(FinalDeliveryError, match="first-value"):
         final_delivery_module.parse_first_value_delivery([call], [result])
+
+
+def test_accepts_material_blocked_retained_as_exact_terminal_report(
+    monkeypatch,
+) -> None:
+    envelope = _material_blocked_envelope()
+    call, result = _pair(envelope=envelope, exit_code=4)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    assert final_delivery_module.parse_first_value_delivery([call], [result]) is None
+    delivery = parse_terminal_final_delivery([call], [result])
+
+    assert delivery.message == envelope["final_report_message"]
+
+
+@pytest.mark.parametrize("exit_code", [0, 5])
+def test_rejects_material_blocked_retained_with_wrong_exit(
+    monkeypatch,
+    exit_code: int,
+) -> None:
+    call, result = _pair(
+        envelope=_material_blocked_envelope(),
+        exit_code=exit_code,
+    )
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError):
+        parse_terminal_final_delivery([call], [result])
+
+
+def test_rejects_material_blocked_report_that_disagrees_with_envelope(
+    monkeypatch,
+) -> None:
+    envelope = _material_blocked_envelope()
+    envelope["material_report"]["blocked_components"] = ["different:1"]
+    call, result = _pair(envelope=envelope, exit_code=4)
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+
+    with pytest.raises(FinalDeliveryError, match="material"):
+        parse_terminal_final_delivery([call], [result])
 
 
 @pytest.mark.parametrize("partial", [False, True])

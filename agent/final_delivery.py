@@ -155,6 +155,58 @@ FIRST_VALUE_DELIVERY_CONTRACT = {
     "post_delivery_visible_text_allowed": False,
 }
 
+MATERIAL_BLOCKED_FINAL_REPORT_CONTRACT = {
+    "version": "a054.material-blocked-report.v1.verbatim",
+    "authoritative_field": "final_report_message",
+    "sha256_field": "final_report_message_sha256",
+    "encoding": "utf-8",
+    "normalization": "none",
+    "delivery": "exact_verbatim",
+    "terminal_newline": "forbidden",
+    "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+    "model_reauthoring_allowed": False,
+    "integrity_status": "RUNNER_VERIFIED",
+    "agent_digest_verification_required": False,
+    "visible_reply": "DIRECT_FIELD_ONLY",
+    "preamble_allowed": False,
+    "suffix_allowed": False,
+    "explanation_allowed": False,
+    "required_fields": [
+        "state",
+        "source_key",
+        "draft_path",
+        "counts",
+        "blocked_components",
+        "reason",
+        "semantic_authoring_allowed",
+        "next_action",
+    ],
+    "counts_source": "durable_material_state",
+    "success": False,
+}
+
+MATERIAL_BLOCKED_DELIVERY_CONTRACT = {
+    "version": "a054.material-blocked-report-delivery.v1",
+    "authoritative_field": "final_report_message",
+    "sha256_field": "final_report_message_sha256",
+    "encoding": "utf-8",
+    "normalization": "none",
+    "mode": "exact_verbatim",
+    "preamble_allowed": False,
+    "suffix_allowed": False,
+    "translation_allowed": False,
+    "reconstruction_allowed": False,
+    "terminal_newline": "forbidden",
+    "terminal_state": "MATERIAL_BLOCKED_RETAINED",
+}
+
+MATERIAL_BLOCK_REASONS = frozenset({
+    "required_material_is_terminal",
+    "required_material_recovery_unavailable",
+    "material_recovery_ceiling_reached",
+    "material_recovery_made_no_progress",
+})
+
 YTS_FINAL_REPORT_CONTRACT = {
     "version": "yts.origin-report.v1.verbatim",
     "authoritative_field": "final_report_message",
@@ -383,6 +435,89 @@ def _validate_v3_completion(envelope: dict[str, Any]) -> None:
         raise FinalDeliveryError("contract: v3 completion header disagrees")
 
 
+def _validate_material_blocked(envelope: dict[str, Any]) -> None:
+    report = envelope.get("material_report")
+    if not isinstance(report, dict) or set(report) != {
+        "state",
+        "source_key",
+        "draft_path",
+        "counts",
+        "blocked_components",
+        "reason",
+        "semantic_authoring_allowed",
+        "next_action",
+    }:
+        raise FinalDeliveryError("contract: material report is invalid")
+    source_key = report.get("source_key")
+    draft_path = report.get("draft_path")
+    reason = report.get("reason")
+    next_action = report.get("next_action")
+    for value in (source_key, draft_path, reason, next_action):
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\n" in value
+            or "\r" in value
+        ):
+            raise FinalDeliveryError("contract: material report text is invalid")
+    counts = report.get("counts")
+    if not isinstance(counts, dict) or set(counts) != {
+        "required",
+        "complete",
+        "pending_retryable",
+        "terminal",
+    }:
+        raise FinalDeliveryError("contract: material counts are invalid")
+    if any(type(counts[key]) is not int or counts[key] < 0 for key in counts):
+        raise FinalDeliveryError("contract: material counts are invalid")
+    required = counts["required"]
+    complete = counts["complete"]
+    pending = counts["pending_retryable"]
+    terminal = counts["terminal"]
+    blocked = report.get("blocked_components")
+    if (
+        required < 1
+        or complete + pending + terminal != required
+        or not isinstance(blocked, list)
+        or not blocked
+        or len(blocked) != pending + terminal
+        or any(not isinstance(item, str) or not item for item in blocked)
+        or len(set(blocked)) != len(blocked)
+        or reason not in MATERIAL_BLOCK_REASONS
+        or report.get("semantic_authoring_allowed") is not False
+        or next_action != "retain_material_state_and_stop"
+    ):
+        raise FinalDeliveryError("contract: material report partition is invalid")
+    for key in (
+        "state",
+        "source_key",
+        "draft_path",
+        "blocked_components",
+        "reason",
+        "semantic_authoring_allowed",
+        "next_action",
+    ):
+        if envelope.get(key) != report.get(key):
+            raise FinalDeliveryError("contract: material envelope disagrees")
+    expected_message = (
+        "Material settlement retained\n"
+        "Status: MATERIAL_BLOCKED_RETAINED\n"
+        f"Source Key: {source_key}\n"
+        f"Draft: {draft_path}\n"
+        f"Required material: {required}\n"
+        f"Complete required material: {complete}\n"
+        f"Pending retryable material: {pending}\n"
+        f"Terminal material: {terminal}\n"
+        f"Blocked components: {', '.join(blocked)}\n"
+        f"Reason: {reason}\n"
+        "Semantic authoring allowed: false\n"
+        f"Next action: {next_action}"
+    )
+    if envelope.get("final_report_message") != expected_message:
+        raise FinalDeliveryError("contract: material report message disagrees")
+
+
 def _extract_envelope(stdout: str) -> dict[str, Any]:
     if not isinstance(stdout, str) or not stdout:
         raise FinalDeliveryError("terminal_result: stdout is empty")
@@ -585,7 +720,7 @@ def parse_first_value_delivery(
             YTS_FINALIZE_PROFILE,
         }),
         allowed_exit_codes={
-            INGEST_PROFILE: INGEST_CONTINUATION_EXIT_CODES | frozenset({0}),
+            INGEST_PROFILE: INGEST_CONTINUATION_EXIT_CODES | frozenset({0, 4}),
             YTS_START_PROFILE: frozenset({0, 4, 5}),
             YTS_FINALIZE_PROFILE: frozenset({0}),
         },
@@ -642,7 +777,7 @@ def parse_terminal_final_delivery(
             YTS_FINALIZE_PROFILE,
         }),
         allowed_exit_codes={
-            INGEST_PROFILE: frozenset({0}),
+            INGEST_PROFILE: frozenset({0, 4}),
             YTS_START_PROFILE: frozenset({4, 5}),
             YTS_FINALIZE_PROFILE: frozenset({0}),
         },
@@ -650,9 +785,15 @@ def parse_terminal_final_delivery(
 
     envelope = _extract_envelope(stdout)
     if profile == INGEST_PROFILE:
-        if envelope.get("state") != "VERIFIED":
-            raise FinalDeliveryError("contract: terminal state is not VERIFIED")
-        report_contract, delivery_contract = _verified_ingest_contracts(envelope)
+        state_exit = (envelope.get("state"), exit_code)
+        if state_exit == ("VERIFIED", 0):
+            report_contract, delivery_contract = _verified_ingest_contracts(envelope)
+        elif state_exit == ("MATERIAL_BLOCKED_RETAINED", 4):
+            _validate_material_blocked(envelope)
+            report_contract = MATERIAL_BLOCKED_FINAL_REPORT_CONTRACT
+            delivery_contract = MATERIAL_BLOCKED_DELIVERY_CONTRACT
+        else:
+            raise FinalDeliveryError("contract: ingest terminal state/exit pair is invalid")
     else:
         if (
             envelope.get("state"),
