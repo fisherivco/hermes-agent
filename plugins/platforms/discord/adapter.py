@@ -5494,7 +5494,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _split_only_raw(content: str, max_length: int) -> list[str]:
-        """Split without adding, deleting, normalizing, or reordering text."""
+        """Split without exposing whitespace at a Discord message boundary.
+
+        Discord normalizes leading and trailing whitespace on each individual
+        message. Exact delivery therefore cannot split *at* whitespace: the
+        wire response would lose that separator even though every message was
+        accepted. Split inside a non-whitespace run instead so concatenating
+        the returned chunks preserves the runner-owned bytes.
+        """
         if len(content) <= max_length:
             return [content]
         chunks: list[str] = []
@@ -5503,10 +5510,17 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(remaining) <= max_length:
                 chunks.append(remaining)
                 break
-            split_at = remaining.rfind("\n", 0, max_length)
-            if split_at < max_length // 2:
-                split_at = remaining.rfind(" ", 0, max_length)
-            if split_at < max_length // 4:
+            split_at = max_length
+            while split_at > 0 and (
+                remaining[split_at - 1].isspace()
+                or remaining[split_at].isspace()
+            ):
+                split_at -= 1
+            if split_at == 0:
+                # There is no platform-stable boundary in this prefix (for
+                # example, a >max_length whitespace run). Keep the raw hard
+                # split; the returned-content check will fail closed if the
+                # provider normalizes it.
                 split_at = max_length
             chunks.append(remaining[:split_at])
             remaining = remaining[split_at:]
