@@ -251,6 +251,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # Ingest FIRST_VALUE_READY is a visible checkpoint, not a terminal state.
+    # This private nudge recovers a provider that tries to stop after delivery.
+    "_ingest_first_value_continue_synthetic",
 )
 
 

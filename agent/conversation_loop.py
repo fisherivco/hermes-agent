@@ -846,6 +846,19 @@ _DROPPED_TOOLCALL_NUDGE_CONTENT = (
     "the actual tool call now to continue the task."
 )
 
+# Re-prompt sent when an ingest turn has already delivered its exact
+# FIRST_VALUE_READY checkpoint but the provider tries to end with ordinary
+# text instead of continuing the identical runner. The checkpoint is a
+# visible milestone, not a terminal state; accepting this stop strands
+# required material work and can never produce VERIFIED_COMPLETE.
+_INGEST_FIRST_VALUE_CONTINUATION_NUDGE = (
+    "[System: FIRST_VALUE_READY was already delivered successfully, but ingest "
+    "is not terminal. Do not repeat, summarize, or encode the checkpoint. "
+    "Call the identical ordinary draft-first-run terminal command now, then "
+    "continue every semantic request through tools until the runner returns "
+    "a terminal report.]"
+)
+
 # Re-prompt sent when the model returns an empty response after executing tool
 # calls (#9400). Named for the same reason as the nudges above — its
 # _empty_recovery_synthetic metadata flag doesn't survive SessionDB projection.
@@ -1600,6 +1613,8 @@ def run_conversation(
     _pending_verification_response_previewed = False
     _typed_final_delivery = None
     _exact_delivery_refusal = None
+    _ingest_first_value_delivered = False
+    _ingest_first_value_stop_retries = 0
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -6882,6 +6897,7 @@ def run_conversation(
                             failed = True
                             _turn_exit_reason = "exact_delivery_refused"
                             break
+                        _ingest_first_value_delivered = True
                         continue
                     try:
                         intermediate_state = parse_declared_intermediate_state(
@@ -7490,6 +7506,34 @@ def run_conversation(
                 final_response = agent._strip_think_blocks(final_response).strip()
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+
+                # FIRST_VALUE_READY is deliberately visible but non-terminal.
+                # A provider can still ignore the runner's continuation action
+                # and return a JSON restatement or narration with
+                # finish_reason=stop. Keep that stochastic model miss from
+                # stranding the lifecycle: discard the ordinary text and issue
+                # a bounded, private nudge back to the identical runner.
+                if (
+                    _ingest_first_value_delivered
+                    and finish_reason == "stop"
+                    and _ingest_first_value_stop_retries < 2
+                ):
+                    _ingest_first_value_stop_retries += 1
+                    messages.append({
+                        "role": "user",
+                        "content": _INGEST_FIRST_VALUE_CONTINUATION_NUDGE,
+                        "_ingest_first_value_continue_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.warning(
+                        "post-FIRST_VALUE ingest text stop — nudging identical "
+                        "runner continuation (%d/2, model=%s provider=%s)",
+                        _ingest_first_value_stop_retries,
+                        agent.model,
+                        agent.provider,
+                    )
+                    final_response = None
+                    continue
 
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5

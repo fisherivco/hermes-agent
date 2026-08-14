@@ -218,6 +218,74 @@ def test_first_value_checkpoint_is_exactly_delivered_then_loop_continues(
     assert result["turn_exit_reason"] == "exact_delivery_success"
 
 
+def test_first_value_text_stop_is_nudged_back_to_identical_runner(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    first_call = _call()
+    resumed_call = _call()
+    first_value_message = "Source Note Draft ready\nSummary: grounded first value"
+    stalled_text = json.dumps(
+        {
+            "first_value_report_message": first_value_message,
+            "first_value_report_message_sha256": hashlib.sha256(
+                first_value_message.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _response(tool_calls=[first_call]),
+        _response(
+            content=stalled_text,
+            tool_calls=None,
+            finish_reason="stop",
+        ),
+        _response(tool_calls=[resumed_call]),
+    ]
+    tool_results = iter(
+        (
+            _first_value_result(first_value_message),
+            _terminal_result("verified final payload"),
+        )
+    )
+
+    def execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            make_tool_result_message(
+                "terminal",
+                next(tool_results),
+                "call-1",
+            )
+        )
+
+    delivered = []
+    agent.first_value_delivery_callback = (
+        lambda message, digest: delivered.append((message, digest)) or True
+    )
+    monkeypatch.setattr(
+        "agent.final_delivery.redact_terminal_output",
+        lambda text, command, force=False: text,
+    )
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("ingest source")
+
+    assert agent.client.chat.completions.create.call_count == 3
+    assert delivered == [
+        (
+            first_value_message,
+            hashlib.sha256(first_value_message.encode("utf-8")).hexdigest(),
+        )
+    ]
+    assert result["final_response"] == "verified final payload"
+    assert result["turn_exit_reason"] == "exact_delivery_success"
+
+
 def test_qualifying_terminal_result_exits_before_model_reauthors_bytes(
     monkeypatch,
     tmp_path,
