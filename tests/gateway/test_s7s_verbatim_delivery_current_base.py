@@ -408,6 +408,36 @@ async def test_discord_exact_delivery_returns_ordered_ack_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_discord_exact_delivery_avoids_normalized_whitespace_boundaries() -> None:
+    sent: list[str] = []
+
+    async def wire_send(*, content, reference=None, allowed_mentions=None):
+        # Discord normalizes whitespace at an individual message boundary.
+        # The ACK must therefore split inside a non-whitespace run so joining
+        # the returned chunks still reproduces the runner-owned bytes.
+        returned = content.strip()
+        sent.append(returned)
+        return SimpleNamespace(id=f"m-{len(sent)}", content=returned)
+
+    adapter = _discord_adapter(SimpleNamespace(type=0, send=wire_send))
+    report = "FIRST_VALUE_READY\nQuick Summary:\n" + ("agent workflow " * 180) + "done"
+    digest = hashlib.sha256(report.encode("utf-8")).hexdigest()
+
+    result = await adapter.send(
+        "42",
+        report,
+        metadata={"exact_delivery": True, "exact_delivery_sha256": digest},
+    )
+
+    assert len(sent) > 1
+    assert all(chunk == chunk.strip() for chunk in sent)
+    assert "".join(sent) == report
+    assert result.success is True
+    assert result.raw_response["returned_content"] == report
+    assert result.raw_response["returned_content_sha256"] == digest
+
+
+@pytest.mark.asyncio
 async def test_discord_exact_delivery_rejects_altered_returned_chunk() -> None:
     calls = 0
 
